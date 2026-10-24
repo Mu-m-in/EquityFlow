@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 300" role="img" aria-labelledby="title desc">
+  <title id="title">TradeHub Logo</title>
+  <desc id="desc">TradeHub wordmark with an ascending three-bar blue icon.</desc>
+  <defs>
+    <linearGradient id="iconGradient" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0%" stop-color="#18B7E8"/>
+      <stop offset="55%" stop-color="#087CF5"/>
+      <stop offset="100%" stop-color="#1747E8"/>
+    </linearGradient>
+    <linearGradient id="hubGradient" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#18B7E8"/>
+      <stop offset="100%" stop-color="#1757F5"/>
+    </linearGradient>
+  </defs>
+
+  <!-- TradeHub mark -->
+  <g transform="translate(18 42)">
+    <rect x="0" y="112" width="78" height="104" rx="30" fill="url(#iconGradient)"/>
+    <rect x="76" y="54" width="92" height="162" rx="30" fill="url(#iconGradient)"/>
+    <rect x="166" y="0" width="112" height="216" rx="30" fill="url(#iconGradient)"/>
+    <path d="M0 173 C72 142 137 128 278 58 L278 216 L0 216 Z"
+          fill="#1248D8" opacity=".42"/>
+  </g>
+
+  <!-- Wordmark -->
+  <text x="330" y="202"
+        font-family="Inter, Arial, Helvetica, sans-serif"
+        font-size="142"
+        font-weight="700"
+        letter-spacing="-6">
+    <tspan fill="#0B1635">Trade</tspan><tspan fill="url(#hubGradient)">Hub</tspan>
+  </text>
+</svg>
