@@ -381,6 +381,50 @@ test("refreshes a stale cache once after the trading session closes", async () =
   assert.equal(fetchCallCount, 1);
 });
 
+
+test("does not retry a failed daily refresh after service reload on the same market day", async () => {
+  marketRecords.set("INFY", {
+    symbol: "INFY",
+    providerSymbol: "INFY.BSE",
+    companyName: "Infosys Limited",
+    date: "2026-10-08",
+    close: 100,
+    history: [{ date: "2026-10-08", close: 100 }],
+    fetchedAt: new Date("2026-10-08T12:30:00.000Z"),
+    source: "Alpha Vantage",
+    isStale: true,
+  });
+
+  global.fetch = async () => {
+    fetchCallCount += 1;
+    return {
+      ok: true,
+      json: async () => ({
+        Note: "Thank you for using Alpha Vantage. Your API call frequency has exceeded the limit.",
+      }),
+    };
+  };
+
+  const firstService = loadService();
+  const firstResult = await firstService.getMarketHistory("INFY");
+
+  assert.equal(fetchCallCount, 1);
+  assert.equal(firstResult.isStale, true);
+  assert.equal(firstResult.data.at(-1).close, 100);
+  assert.equal(
+    symbolMappings.get("INFY").lastFetchErrorCode,
+    "MARKET_DATA_RATE_LIMITED",
+  );
+
+  const restartedService = loadService();
+  const secondResult = await restartedService.getMarketHistory("INFY");
+
+  assert.equal(fetchCallCount, 1);
+  assert.equal(secondResult.isStale, true);
+  assert.equal(secondResult.data.at(-1).close, 100);
+});
+
+
 test("returns persisted data as stale after an Alpha Vantage rate-limit response", async () => {
   const oldRecord = {
     symbol: "INFY",
