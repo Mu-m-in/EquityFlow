@@ -244,6 +244,44 @@ test("coalesces simultaneous requests for the same uncached symbol", async () =>
   assert.deepEqual(firstResult, secondResult);
 });
 
+
+test("shares the daily quota across concurrent requests for different stale symbols", async () => {
+  for (const stock of [
+    { symbol: "INFY", providerSymbol: "INFY.BSE", companyName: "Infosys Limited" },
+    { symbol: "TCS", providerSymbol: "TCS.BSE", companyName: "Tata Consultancy Services Limited" },
+  ]) {
+    marketRecords.set(stock.symbol, {
+      ...stock,
+      date: "2026-10-08",
+      close: 100,
+      history: [{ date: "2026-10-08", close: 100 }],
+      fetchedAt: new Date("2026-10-08T12:30:00.000Z"),
+      source: "Alpha Vantage",
+      isStale: true,
+    });
+
+    symbolMappings.set(stock.symbol, {
+      ...stock,
+      lastFetchAttemptAt: null,
+      lastFetchError: null,
+      lastFetchErrorCode: null,
+    });
+  }
+
+  const service = loadService();
+
+  const results = await Promise.all([
+    service.getMarketHistory("INFY"),
+    service.getMarketHistory("TCS"),
+  ]);
+
+  assert.equal(fetchCallCount, 2);
+  assert.equal(quotaCount, 2);
+  assert.equal(results.length, 2);
+  assert.ok(results.every((result) => result.data.length > 0));
+});
+
+
 test("does not refresh a close already fetched for the current market session", async () => {
   marketRecords.set("INFY", {
     symbol: "INFY",
