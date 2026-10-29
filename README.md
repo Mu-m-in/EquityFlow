@@ -9,6 +9,22 @@ to a brokerage or move real money.
 The project is split into a public website, a trading dashboard, and a backend
 API. Each web application is built and run independently.
 
+**Live Demo:** [EquityFlow](https://equity-floww.vercel.app/)
+
+## Quick start
+
+- [ ] Install Node.js `^20.19.0` or `>=22.12.0`, npm, and a
+  replica-set-capable MongoDB database. An Alpha Vantage key is needed for
+  uncached market data.
+- [ ] Clone the repository and run `npm ci` in `backend/`, `frontend/`, and
+  `dashboard/` ([commands](#clone-and-install)).
+- [ ] Copy the three `.env.example` files to the local filenames and configure
+  the backend origins, MongoDB URL, and private JWT secret
+  ([environment variables](#environment-variables)).
+- [ ] Seed default tradable symbols with `npm run seed:stocks` from `backend/`.
+- [ ] Start the backend, public website, and dashboard in separate terminals
+  ([local run commands](#run-locally)).
+
 ## Key features
 
 - Account registration, login, session checks, and logout using JWTs in an
@@ -47,12 +63,12 @@ and fetches or serves cached market data.
 
 ```mermaid
 flowchart LR
-    Visitor[Visitor] --> Frontend[Public website<br/>React and Vite]
-    User[Signed-in user] --> Dashboard[Trading dashboard<br/>React and Vite]
-    Frontend -->|Credentialed API requests| API[Express API]
+    Visitor["Visitor"] --> Frontend["Public website (React + Vite)"]
+    User["Signed-in user"] --> Dashboard["Trading dashboard (React + Vite)"]
+    Frontend -->|Credentialed API requests| API["Express API"]
     Dashboard -->|Credentialed API requests| API
-    API -->|Users, funds, orders,<br/>portfolio and cached prices| MongoDB[(MongoDB)]
-    API -->|Daily market data and symbol search| AlphaVantage[Alpha Vantage]
+    API -->|Users, funds, orders, portfolio, cached prices| MongoDB[("MongoDB")]
+    API -->|Daily market data and symbol search| AlphaVantage["Alpha Vantage"]
 ```
 
 In the documented deployment arrangement, the two web apps are deployed as
@@ -71,19 +87,32 @@ allowlist is configured with the exact public origins of both web apps.
 │   ├── schemas/              # MongoDB schemas
 │   ├── scripts/              # Stock seeding and demo-data cleanup
 │   ├── services/             # Market data and portfolio services
+│   ├── .env.example
 │   ├── config.js
-│   └── index.js              # Express API and application startup
+│   ├── index.js              # Express API and application startup
+│   ├── package.json
+│   └── README.md
 ├── dashboard/
-│   ├── src/components/       # Trading dashboard views
-│   ├── src/                  # Dashboard app, config and styles
+│   ├── public/
+│   │   └── tradehub-favicon.svg
+│   ├── src/
+│   │   └── components/       # Trading dashboard views
+│   ├── .env.example
+│   ├── index.html
+│   ├── package.json
 │   ├── README.md
-│   └── package.json
+│   └── vercel.json
 ├── frontend/
 │   ├── public/               # Website artwork and static assets
-│   ├── src/landing_page/     # Public website pages
-│   ├── src/                  # Website app, auth context and styles
+│   │   └── equityflow-favicon.svg
+│   ├── src/
+│   │   ├── landing_page/     # Public website pages
+│   │   └── tests/
+│   ├── .env.example
+│   ├── index.html
+│   ├── package.json
 │   ├── README.md
-│   └── package.json
+│   └── vercel.json
 └── README.md
 ```
 
