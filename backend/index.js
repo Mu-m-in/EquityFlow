@@ -28,7 +28,7 @@ const {
 const { summarizePortfolio } = require("./services/portfolioSummary");
 const { logMarketDataUnavailable } = require("./services/marketDataLogging");
 
-const PORT = Number(process.env.PORT);
+const PORT = Number(process.env.PORT) || 3002;
 const uri = process.env.MONGO_URL;
 const jwtSecret = process.env.JWT_SECRET;
 const frontendUrl = process.env.FRONTEND_URL;
