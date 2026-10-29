@@ -22,6 +22,7 @@ const {
   MarketDataError,
   getMarketHistory,
   getMarketQuote,
+  getMarketDataRequestGroups,
   getWatchlistSymbol,
   searchMarketSymbols,
 } = require("./services/marketDataService");
@@ -408,39 +409,64 @@ app.get("/watchlist", requireAuth, async (req, res) => {
     const tradableSymbols = new Set(
       defaultStocks.map((stock) => stock.symbol),
     );
-    const quotes = await Promise.all(
-      stocks.map(async (stock) => {
-        try {
-          const quote = await getMarketQuote(stock.symbol);
-          const changePercent = quote.changePercent;
-          return {
-            symbol: stock.symbol,
-            companyName: quote.companyName,
-            price: quote.price,
-            percent: Number.isFinite(changePercent)
-              ? `${changePercent > 0 ? "+" : ""}${changePercent.toFixed(2)}%`
-              : "—",
-            isDown: Number.isFinite(changePercent) && changePercent < 0,
-            timestamp: quote.timestamp,
-            source: quote.source,
-            isStale: quote.isStale,
-            canTrade: tradableSymbols.has(stock.symbol),
-          };
-        } catch (error) {
-          logMarketDataUnavailable(stock.symbol, error);
-          return {
-            symbol: stock.symbol,
-            price: null,
-            percent: "—",
-            isDown: false,
-            canTrade: tradableSymbols.has(stock.symbol),
-            isStale: true,
-          };
-        }
-      }),
+    const loadWatchlistQuote = async (stock) => {
+      try {
+        const quote = await getMarketQuote(stock.symbol);
+        const changePercent = quote.changePercent;
+        return {
+          symbol: stock.symbol,
+          companyName: quote.companyName,
+          price: quote.price,
+          percent: Number.isFinite(changePercent)
+            ? `${changePercent > 0 ? "+" : ""}${changePercent.toFixed(2)}%`
+            : "—",
+          isDown: Number.isFinite(changePercent) && changePercent < 0,
+          timestamp: quote.timestamp,
+          source: quote.source,
+          isStale: quote.isStale,
+          canTrade: tradableSymbols.has(stock.symbol),
+        };
+      } catch (error) {
+        logMarketDataUnavailable(stock.symbol, error);
+        return {
+          symbol: stock.symbol,
+          price: null,
+          percent: "—",
+          isDown: false,
+          canTrade: tradableSymbols.has(stock.symbol),
+          isStale: true,
+        };
+      }
+    };
+    const requestGroups = await getMarketDataRequestGroups(
+      stocks.map((stock) => stock.symbol),
+    );
+    const stocksBySymbol = new Map(stocks.map((stock) => [stock.symbol, stock]));
+    const [uncachedQuotes, cachedQuotes] = await Promise.all([
+      Promise.all(
+        requestGroups.uncached.map((symbol) =>
+          loadWatchlistQuote(stocksBySymbol.get(symbol)),
+        ),
+      ),
+      Promise.all(
+        requestGroups.cached.map((symbol) =>
+          loadWatchlistQuote(stocksBySymbol.get(symbol)),
+        ),
+      ),
+    ]);
+    const refreshableQuotes = await Promise.all(
+      requestGroups.refreshable.map((symbol) =>
+        loadWatchlistQuote(stocksBySymbol.get(symbol)),
+      ),
+    );
+    const quotesBySymbol = new Map(
+      [...uncachedQuotes, ...cachedQuotes, ...refreshableQuotes].map((quote) => [
+        quote.symbol,
+        quote,
+      ]),
     );
 
-    return res.json(quotes);
+    return res.json(stocks.map((stock) => quotesBySymbol.get(stock.symbol)));
   } catch (error) {
     console.error("Unable to load watchlist market data", error);
     return res.status(500).json({ message: "Unable to load watchlist" });

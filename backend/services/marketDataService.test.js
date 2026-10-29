@@ -8,9 +8,7 @@ const { summarizePortfolio } = require("./portfolioSummary");
 
 const marketRecords = new Map();
 const symbolMappings = new Map();
-let quotaCount = 0;
-let quotaDay = null;
-let quotaCooldownUntil = null;
+const quotaRecords = new Map();
 let fetchCallCount = 0;
 const updateOptions = {
   cache: [],
@@ -23,6 +21,18 @@ const asQuery = (value) => ({
   lean: async () => value,
   then: (resolve, reject) => Promise.resolve(value).then(resolve, reject),
 });
+
+const getQuotaDay = () => new Date().toISOString().slice(0, 10);
+const getQuotaCount = (day = getQuotaDay()) =>
+  quotaRecords.get(day)?.count || 0;
+const getQuotaCooldownUntil = (day = getQuotaDay()) =>
+  quotaRecords.get(day)?.cooldownUntil || null;
+const setQuotaCount = (count, day = getQuotaDay()) => {
+  quotaRecords.set(day, {
+    ...quotaRecords.get(day),
+    count,
+  });
+};
 
 const matchMapping = (mapping, filter) => {
   if (!mapping) {
@@ -40,6 +50,12 @@ const matchMapping = (mapping, filter) => {
 
 MarketDataCacheModel.findOne = ({ symbol }) =>
   asQuery(marketRecords.get(symbol) || null);
+MarketDataCacheModel.find = ({ symbol }) =>
+  asQuery(
+    [...marketRecords.values()].filter((record) =>
+      symbol.$in.includes(record.symbol),
+    ),
+  );
 MarketDataCacheModel.findOneAndUpdate = ({ symbol }, update, options) => {
   updateOptions.cache.push(options);
   const record = {
@@ -98,31 +114,29 @@ MarketSymbolMappingModel.updateOne = async (filter, update) => {
 };
 
 AlphaVantageQuotaModel.findOne = ({ _id }) =>
-  asQuery(
-    quotaDay === _id
-      ? { _id, count: quotaCount, cooldownUntil: quotaCooldownUntil }
-      : null,
-  );
+  asQuery(quotaRecords.has(_id) ? { _id, ...quotaRecords.get(_id) } : null);
 AlphaVantageQuotaModel.updateOne = async ({ _id }, update) => {
-  quotaDay = _id;
+  const record = quotaRecords.get(_id) || { count: 0 };
   if (update.$max?.cooldownUntil) {
-    quotaCooldownUntil = new Date(
+    record.cooldownUntil = new Date(
       Math.max(
-        quotaCooldownUntil?.getTime() || 0,
+        record.cooldownUntil?.getTime() || 0,
         update.$max.cooldownUntil.getTime(),
       ),
     );
   }
+  quotaRecords.set(_id, record);
   return { acknowledged: true };
 };
 AlphaVantageQuotaModel.findOneAndUpdate = async (filter, update, options) => {
   updateOptions.quota.push(options);
-  if (quotaCount >= 25) {
+  const record = quotaRecords.get(filter._id) || { count: 0 };
+  if (record.count >= filter.count.$lt) {
     return null;
   }
-  quotaDay = filter._id;
-  quotaCount += 1;
-  return { count: quotaCount };
+  record.count += update.$inc.count;
+  quotaRecords.set(filter._id, record);
+  return { count: record.count };
 };
 
 const makeDailyResponse = (extra = {}) => ({
@@ -161,9 +175,7 @@ beforeEach((t) => {
   });
   marketRecords.clear();
   symbolMappings.clear();
-  quotaCount = 0;
-  quotaDay = null;
-  quotaCooldownUntil = null;
+  quotaRecords.clear();
   fetchCallCount = 0;
   updateOptions.cache.length = 0;
   updateOptions.mapping.length = 0;
@@ -187,6 +199,7 @@ test("persists a daily snapshot and reuses it after service reload", async () =>
   assert.equal(marketRecords.get("INFY").date, "2026-10-09");
   assert.ok(marketRecords.get("INFY").fetchedAt instanceof Date);
   assert.equal(first.data.at(-1).date, "2026-10-09");
+  assert.equal(first.data.length, 2);
   assert.equal(first.isStale, false);
   assert.deepEqual(updateOptions.mapping[0], {
     returnDocument: "after",
@@ -207,7 +220,7 @@ test("persists a daily snapshot and reuses it after service reload", async () =>
   service = loadService();
   const afterRestart = await service.getMarketHistory("INFY");
   assert.equal(fetchCallCount, 1);
-  assert.equal(quotaCount, 1);
+  assert.equal(getQuotaCount(), 1);
   assert.deepEqual(afterRestart.data, first.data);
 });
 
@@ -219,7 +232,7 @@ test("returns a persisted successful quote after service restart", async () => {
   assert.equal(quoteAfterRestart.timestamp, initialQuote.timestamp);
   assert.equal(quoteAfterRestart.isStale, false);
   assert.equal(fetchCallCount, 1);
-  assert.equal(quotaCount, 1);
+  assert.equal(getQuotaCount(), 1);
 });
 
 test("coalesces simultaneous requests for the same uncached symbol", async () => {
@@ -245,7 +258,8 @@ test("coalesces simultaneous requests for the same uncached symbol", async () =>
 });
 
 
-test("shares the daily quota across concurrent requests for different stale symbols", async () => {
+test("does not exceed the daily quota across concurrent stale-symbol requests", async () => {
+  setQuotaCount(24);
   for (const stock of [
     { symbol: "INFY", providerSymbol: "INFY.BSE", companyName: "Infosys Limited" },
     { symbol: "TCS", providerSymbol: "TCS.BSE", companyName: "Tata Consultancy Services Limited" },
@@ -275,10 +289,39 @@ test("shares the daily quota across concurrent requests for different stale symb
     service.getMarketHistory("TCS"),
   ]);
 
-  assert.equal(fetchCallCount, 2);
-  assert.equal(quotaCount, 2);
+  assert.equal(fetchCallCount, 1);
+  assert.equal(getQuotaCount(), 25);
   assert.equal(results.length, 2);
   assert.ok(results.every((result) => result.data.length > 0));
+});
+
+test("prioritizes uncached symbols before stale cached refreshes within the shared quota", async () => {
+  setQuotaCount(24);
+  marketRecords.set("INFY", {
+    symbol: "INFY",
+    providerSymbol: "INFY.BSE",
+    companyName: "Infosys Limited",
+    date: "2026-10-08",
+    close: 100,
+    history: [{ date: "2026-10-08", close: 100 }],
+    fetchedAt: new Date("2026-10-08T12:30:00.000Z"),
+    source: "Alpha Vantage",
+    isStale: true,
+  });
+  const service = loadService();
+  const groups = await service.getMarketDataRequestGroups(["INFY", "HUL"]);
+
+  assert.deepEqual(groups.uncached, ["HUL"]);
+  assert.deepEqual(groups.refreshable, ["INFY"]);
+
+  const uncachedResult = await service.getMarketHistory(groups.uncached[0]);
+  const cachedResult = await service.getMarketHistory(groups.refreshable[0]);
+
+  assert.equal(fetchCallCount, 1);
+  assert.equal(getQuotaCount(), 25);
+  assert.equal(uncachedResult.data.at(-1).date, "2026-10-09");
+  assert.equal(cachedResult.isStale, true);
+  assert.equal(cachedResult.data.at(-1).date, "2026-10-08");
 });
 
 
@@ -300,6 +343,145 @@ test("does not refresh a close already fetched for the current market session", 
   assert.equal(result.isStale, false);
   assert.equal(result.data.at(-1).date, "2026-10-09");
   assert.equal(fetchCallCount, 0);
+});
+
+test("fetches completed historical closes for an uncached symbol during market hours", async (t) => {
+  t.mock.timers.setTime(Date.parse("2026-10-09T04:30:00.000Z"));
+
+  const result = await loadService().getMarketHistory("INFY");
+
+  assert.equal(fetchCallCount, 1);
+  assert.equal(getQuotaCount(), 1);
+  assert.equal(result.isStale, false);
+  assert.equal(result.data.at(-1).date, "2026-10-08");
+  assert.equal(result.data.at(-1).close, 100);
+  assert.equal(marketRecords.get("INFY").date, "2026-10-08");
+});
+
+test("refreshes a future-dated persisted cache instead of returning its close", async () => {
+  marketRecords.set("INFY", {
+    symbol: "INFY",
+    providerSymbol: "INFY.BSE",
+    companyName: "Infosys Limited",
+    date: "2026-10-10",
+    close: 999,
+    history: [{ date: "2026-10-10", close: 999 }],
+    fetchedAt: new Date("2026-10-10T12:30:00.000Z"),
+    source: "Alpha Vantage",
+    isStale: false,
+  });
+
+  const result = await loadService().getMarketHistory("INFY");
+
+  assert.equal(result.data.at(-1).date, "2026-10-09");
+  assert.equal(result.data.at(-1).close, 105);
+  assert.notEqual(result.data.at(-1).close, 999);
+});
+
+test("selects the latest completed row from a cache containing a future row", async () => {
+  marketRecords.set("INFY", {
+    symbol: "INFY",
+    providerSymbol: "INFY.BSE",
+    companyName: "Infosys Limited",
+    date: "2026-10-10",
+    close: 999,
+    history: [
+      { date: "2026-10-08", close: 100 },
+      { date: "2026-10-09", close: 105 },
+      { date: "2026-10-10", close: 999 },
+    ],
+    fetchedAt: new Date("2026-10-10T12:30:00.000Z"),
+    source: "Alpha Vantage",
+    isStale: false,
+  });
+  symbolMappings.set("INFY", {
+    symbol: "INFY",
+    providerSymbol: "INFY.BSE",
+    companyName: "Infosys Limited",
+    lastDailyFetchAttemptAt: new Date("2026-10-09T10:00:00.000Z"),
+    lastDailyFetchAttemptHadCache: true,
+    lastFetchError: null,
+    lastFetchErrorCode: null,
+  });
+
+  const result = await loadService().getMarketHistory("INFY");
+
+  assert.equal(fetchCallCount, 0);
+  assert.equal(result.data.at(-1).date, "2026-10-09");
+  assert.equal(result.data.at(-1).close, 105);
+  assert.ok(result.data.every((row) => row.date <= "2026-10-09"));
+});
+
+test("does not return a persisted close beyond the 30-day maximum stale age", async (t) => {
+  t.mock.timers.setTime(Date.parse("2026-11-15T12:30:00.000Z"));
+  setQuotaCount(25);
+  marketRecords.set("INFY", {
+    symbol: "INFY",
+    providerSymbol: "INFY.BSE",
+    companyName: "Infosys Limited",
+    date: "2026-10-08",
+    close: 100,
+    history: [{ date: "2026-10-08", close: 100 }],
+    fetchedAt: new Date("2026-10-08T12:30:00.000Z"),
+    source: "Alpha Vantage",
+    isStale: true,
+  });
+  await assert.rejects(loadService().getMarketHistory("INFY"), {
+    code: "MARKET_DATA_DAILY_QUOTA_EXHAUSTED",
+  });
+
+  assert.equal(fetchCallCount, 0);
+  assert.equal(marketRecords.get("INFY").date, "2026-10-08");
+});
+
+test("returns a valid 21-day-old observation as stale when quota blocks refresh", async (t) => {
+  t.mock.timers.setTime(Date.parse("2026-10-29T12:30:00.000Z"));
+  setQuotaCount(25);
+  marketRecords.set("INFY", {
+    symbol: "INFY",
+    providerSymbol: "INFY.BSE",
+    companyName: "Infosys Limited",
+    date: "2026-10-08",
+    close: 100,
+    history: [{ date: "2026-10-08", close: 100 }],
+    fetchedAt: new Date("2026-10-28T12:30:00.000Z"),
+    source: "Alpha Vantage",
+    isStale: true,
+  });
+
+  const result = await loadService().getMarketHistory("INFY");
+
+  assert.equal(fetchCallCount, 0);
+  assert.equal(result.isStale, true);
+  assert.equal(result.data.at(-1).date, "2026-10-08");
+  assert.equal(result.data.at(-1).close, 100);
+});
+
+test("keeps a recent stale cache available as a marked fallback", async (t) => {
+  t.mock.timers.setTime(Date.parse("2026-10-29T12:30:00.000Z"));
+  marketRecords.set("INFY", {
+    symbol: "INFY",
+    providerSymbol: "INFY.BSE",
+    companyName: "Infosys Limited",
+    date: "2026-10-28",
+    close: 105,
+    history: [{ date: "2026-10-28", close: 105 }],
+    fetchedAt: new Date("2026-10-28T12:30:00.000Z"),
+    source: "Alpha Vantage",
+    isStale: true,
+  });
+  global.fetch = async () => {
+    fetchCallCount += 1;
+    return { ok: false, status: 503 };
+  };
+
+  const result = await loadService().getMarketHistory("INFY");
+
+  assert.equal(fetchCallCount, 1);
+  assert.equal(result.isStale, true);
+  assert.equal(result.data.at(-1).date, "2026-10-28");
+  assert.equal(result.data.at(-1).close, 105);
+  assert.match(result.marketDataError, /unsuccessful response/i);
 });
 
 test("retains the latest completed close over the weekend without provider calls", async (t) => {
@@ -419,6 +601,25 @@ test("refreshes a stale cache once after the trading session closes", async () =
   assert.equal(fetchCallCount, 1);
 });
 
+test("refreshes a cache after close when its initial fetch happened earlier that day", async (t) => {
+  t.mock.timers.setTime(Date.parse("2026-10-09T04:30:00.000Z"));
+  const service = loadService();
+
+  const initialResult = await service.getMarketHistory("INFY");
+  assert.equal(initialResult.data.at(-1).date, "2026-10-08");
+  assert.equal(fetchCallCount, 1);
+  assert.equal(symbolMappings.get("INFY").lastDailyFetchAttemptHadCache, false);
+
+  t.mock.timers.setTime(Date.parse("2026-10-09T11:00:00.000Z"));
+  const refreshedResult = await service.getMarketHistory("INFY");
+
+  assert.equal(fetchCallCount, 2);
+  assert.equal(getQuotaCount(), 2);
+  assert.equal(refreshedResult.isStale, false);
+  assert.equal(refreshedResult.data.at(-1).date, "2026-10-09");
+  assert.equal(symbolMappings.get("INFY").lastDailyFetchAttemptHadCache, true);
+});
+
 
 test("does not retry a failed daily refresh after service reload on the same market day", async () => {
   marketRecords.set("INFY", {
@@ -460,6 +661,115 @@ test("does not retry a failed daily refresh after service reload on the same mar
   assert.equal(fetchCallCount, 1);
   assert.equal(secondResult.isStale, true);
   assert.equal(secondResult.data.at(-1).close, 100);
+});
+
+test("retries an uncached symbol after a quota reservation block resets", async (t) => {
+  setQuotaCount(25);
+  const service = loadService();
+
+  await assert.rejects(service.getMarketHistory("HUL"), {
+    code: "MARKET_DATA_DAILY_QUOTA_EXHAUSTED",
+  });
+  assert.equal(fetchCallCount, 0);
+  assert.equal(symbolMappings.get("HUL").lastDailyFetchAttemptAt, undefined);
+
+  t.mock.timers.setTime(Date.parse("2026-10-10T00:01:00.000Z"));
+  const result = await service.getMarketHistory("HUL");
+
+  assert.equal(fetchCallCount, 1);
+  assert.equal(getQuotaCount(), 1);
+  assert.equal(result.data.at(-1).date, "2026-10-09");
+});
+
+test("retries an uncached symbol after a persisted provider cooldown expires", async (t) => {
+  t.mock.timers.setTime(Date.parse("2026-10-09T20:00:00.000Z"));
+  setQuotaCount(24);
+  global.fetch = async () => {
+    fetchCallCount += 1;
+    if (fetchCallCount === 1) {
+      return {
+        ok: true,
+        json: async () => ({
+          Note: "Thank you for using Alpha Vantage. Your API call frequency has exceeded the limit.",
+        }),
+      };
+    }
+    return makeDailyResponse();
+  };
+
+  const service = loadService();
+  await assert.rejects(service.getMarketHistory("HUL"), {
+    code: "MARKET_DATA_RATE_LIMITED",
+  });
+  await assert.rejects(service.getMarketHistory("HUL"), {
+    code: "MARKET_DATA_RATE_LIMITED",
+  });
+  assert.equal(fetchCallCount, 1);
+  assert.equal(getQuotaCount("2026-10-09"), 25);
+
+  t.mock.timers.setTime(Date.parse("2026-10-10T00:01:00.000Z"));
+  const result = await service.getMarketHistory("HUL");
+
+  assert.equal(fetchCallCount, 2);
+  assert.equal(getQuotaCount("2026-10-10"), 1);
+  assert.equal(result.data.at(-1).date, "2026-10-09");
+});
+
+test("does not retry genuine provider failures on every request", async () => {
+  global.fetch = async () => {
+    fetchCallCount += 1;
+    return { ok: false, status: 503 };
+  };
+  const service = loadService();
+
+  await assert.rejects(service.getMarketHistory("HUL"), {
+    code: "MARKET_DATA_PROVIDER_ERROR",
+  });
+  await assert.rejects(service.getMarketHistory("HUL"), {
+    code: "MARKET_DATA_PROVIDER_ERROR",
+  });
+
+  assert.equal(fetchCallCount, 1);
+  assert.equal(getQuotaCount(), 1);
+});
+
+test("does not overwrite a valid cache when provider rows have no completed candle", async () => {
+  marketRecords.set("INFY", {
+    symbol: "INFY",
+    providerSymbol: "INFY.BSE",
+    companyName: "Infosys Limited",
+    date: "2026-10-08",
+    close: 100,
+    history: [{ date: "2026-10-08", close: 100 }],
+    fetchedAt: new Date("2026-10-08T12:30:00.000Z"),
+    source: "Alpha Vantage",
+    isStale: true,
+  });
+  global.fetch = async () => {
+    fetchCallCount += 1;
+    return {
+      ok: true,
+      json: async () => ({
+        "Time Series (Daily)": {
+          "2026-10-10": {
+            "1. open": "100",
+            "2. high": "110",
+            "3. low": "95",
+            "4. close": "999",
+            "5. volume": "1000",
+          },
+        },
+      }),
+    };
+  };
+
+  const result = await loadService().getMarketHistory("INFY");
+
+  assert.equal(fetchCallCount, 1);
+  assert.equal(result.isStale, true);
+  assert.equal(result.data.at(-1).date, "2026-10-08");
+  assert.equal(marketRecords.get("INFY").date, "2026-10-08");
+  assert.equal(marketRecords.get("INFY").close, 100);
 });
 
 
@@ -510,7 +820,7 @@ test("returns persisted data as stale after an Alpha Vantage rate-limit response
   assert.equal(afterRestart.isStale, true);
   assert.equal(afterRestart.data[0].close, 100);
   assert.equal(fetchCallCount, 1);
-  assert.equal(quotaCount, 1);
+  assert.equal(getQuotaCount(), 1);
 });
 
 test("keeps the rate-limit cooldown across service restarts and leaves HUL unavailable", async () => {
@@ -532,7 +842,7 @@ test("keeps the rate-limit cooldown across service restarts and leaves HUL unava
   });
   assert.equal(fetchCallCount, 1);
   assert.equal(marketRecords.has("HUL"), false);
-  assert.ok(quotaCooldownUntil > new Date());
+  assert.ok(getQuotaCooldownUntil() > new Date());
 
   const restartedService = loadService();
   await assert.rejects(restartedService.getMarketQuote("HUL"), {
@@ -544,8 +854,9 @@ test("keeps the rate-limit cooldown across service restarts and leaves HUL unava
     statusCode: 429,
   });
   assert.equal(fetchCallCount, 1);
-  assert.equal(quotaCount, 1);
+  assert.equal(getQuotaCount(), 1);
   assert.equal(marketRecords.has("HUL"), false);
+  assert.equal(symbolMappings.get("TCS").lastDailyFetchAttemptAt, undefined);
 });
 
 test("persists the cooldown when Alpha Vantage responds with HTTP 429", async () => {
@@ -564,8 +875,8 @@ test("persists the cooldown when Alpha Vantage responds with HTTP 429", async ()
     statusCode: 429,
   });
   assert.equal(fetchCallCount, 1);
-  assert.equal(quotaCount, 1);
-  assert.ok(quotaCooldownUntil > new Date());
+  assert.equal(getQuotaCount(), 1);
+  assert.ok(getQuotaCooldownUntil() > new Date());
 });
 
 test("retries after the persisted daily quota window expires", async (t) => {
@@ -587,9 +898,6 @@ test("retries after the persisted daily quota window expires", async (t) => {
     code: "MARKET_DATA_RATE_LIMITED",
   });
   t.mock.timers.tick(72 * 60 * 60 * 1000);
-  quotaCount = 0;
-  quotaDay = null;
-  quotaCooldownUntil = null;
 
   const result = await service.getMarketHistory("HUL");
   assert.equal(fetchCallCount, 2);
@@ -603,7 +911,7 @@ test("does not spend quota or call the provider when the API key is missing", as
     code: "MARKET_DATA_NOT_CONFIGURED",
   });
   assert.equal(fetchCallCount, 0);
-  assert.equal(quotaCount, 0);
+  assert.equal(getQuotaCount(), 0);
 });
 
 test("calculates quote changes from the previous trading close", async () => {
@@ -616,9 +924,9 @@ test("calculates quote changes from the previous trading close", async () => {
 });
 
 test("blocks provider calls after the persistent daily quota is exhausted", async () => {
-  quotaCount = 25;
+  setQuotaCount(25);
   await assert.rejects(loadService().getMarketHistory("INFY"), {
-    code: "MARKET_DATA_RATE_LIMITED",
+    code: "MARKET_DATA_DAILY_QUOTA_EXHAUSTED",
     statusCode: 429,
   });
   assert.equal(fetchCallCount, 0);

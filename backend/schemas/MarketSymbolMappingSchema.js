@@ -11,6 +11,8 @@ const MarketSymbolMappingSchema = new Schema(
     matchScore: { type: Number, default: 0 },
     searchQueries: { type: [String], default: [] },
     lastFetchAttemptAt: { type: Date, default: null },
+    lastDailyFetchAttemptAt: { type: Date, default: null },
+    lastDailyFetchAttemptHadCache: { type: Boolean, default: null },
     lastFetchError: { type: String, default: null },
     lastFetchErrorCode: { type: String, default: null },
   },

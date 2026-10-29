@@ -1,9 +1,11 @@
 const ALPHA_VANTAGE_URL = "https://www.alphavantage.co/query";
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const STALE_CACHE_TTL_MS = 7 * CACHE_TTL_MS;
+const MAX_STALE_DAILY_AGE_MS = 30 * CACHE_TTL_MS;
 const MAX_REQUESTS_PER_24H = 25;
 const SOURCE = "Alpha Vantage";
 const RATE_LIMITED_CODE = "MARKET_DATA_RATE_LIMITED";
+const DAILY_QUOTA_EXHAUSTED_CODE = "MARKET_DATA_DAILY_QUOTA_EXHAUSTED";
 const INDIA_TIME_ZONE = "Asia/Kolkata";
 const MARKET_CLOSE_MINUTES = 15 * 60 + 30;
 const KNOWN_SYMBOLS = [
@@ -56,6 +58,65 @@ const getQuotaWindowEnd = (date = new Date()) =>
       date.getUTCDate() + 1,
     ),
   );
+
+const isValidDailyDate = (date) => {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date || "")) {
+    return false;
+  }
+  const parsed = new Date(`${date}T00:00:00.000Z`);
+  return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === date;
+};
+
+const isCompletedDailyRow = (row, completedSessionDate) =>
+  row &&
+  isValidDailyDate(row.date) &&
+  row.date <= completedSessionDate &&
+  Number.isFinite(row.close);
+
+const isWithinMaximumStaleAge = (date, completedSessionDate) => {
+  const observationAge =
+    Date.parse(`${completedSessionDate}T00:00:00.000Z`) -
+    Date.parse(`${date}T00:00:00.000Z`);
+  return observationAge >= 0 && observationAge <= MAX_STALE_DAILY_AGE_MS;
+};
+
+const getUsableCachedRecord = (record, now = new Date()) => {
+  if (!record) {
+    return null;
+  }
+
+  const completedSessionDate = getLatestCompletedSessionDate(now);
+  const rowsByDate = new Map();
+  for (const row of Array.isArray(record.history) ? record.history : []) {
+    if (isCompletedDailyRow(row, completedSessionDate)) {
+      rowsByDate.set(row.date, row);
+    }
+  }
+  if (isCompletedDailyRow(record, completedSessionDate)) {
+    rowsByDate.set(
+      record.date,
+      Object.fromEntries(
+        ["date", "open", "high", "low", "close", "volume"]
+          .filter((key) => Object.hasOwn(record, key))
+          .map((key) => [key, record[key]]),
+      ),
+    );
+  }
+
+  const history = [...rowsByDate.values()].sort((first, second) =>
+    first.date.localeCompare(second.date),
+  );
+  const latest = history.at(-1);
+  if (!latest) {
+    return null;
+  }
+
+  if (!isWithinMaximumStaleAge(latest.date, completedSessionDate)) {
+    return null;
+  }
+
+  return { ...record, ...latest, history };
+};
 
 const getRetryAt = (error, failedAt = new Date()) =>
   error.statusCode === 429
@@ -146,7 +207,7 @@ const reserveDailyRequest = async () => {
     throw new MarketDataError(
       "The daily Alpha Vantage request budget has been reached. Please try again later.",
       429,
-      RATE_LIMITED_CODE,
+      DAILY_QUOTA_EXHAUSTED_CODE,
     );
   }
 };
@@ -249,9 +310,46 @@ const canRefreshDailyData = (now = new Date()) => {
 const isRecordStale = (record, now = new Date()) =>
   record.date < getLatestCompletedSessionDate(now);
 
+const getMarketDataRequestGroups = async (symbols, now = new Date()) => {
+  const cachedRecords = await MarketDataCacheModel.find({
+    symbol: { $in: symbols },
+  }).lean();
+  const recordsBySymbol = new Map(
+    cachedRecords.map((record) => [record.symbol, record]),
+  );
+  const groups = { uncached: [], refreshable: [], cached: [] };
+
+  for (const symbol of symbols) {
+    const record = getUsableCachedRecord(recordsBySymbol.get(symbol), now);
+    if (!record) {
+      groups.uncached.push(symbol);
+    } else if (isRecordStale(record, now)) {
+      groups.refreshable.push(symbol);
+    } else {
+      groups.cached.push(symbol);
+    }
+  }
+
+  return groups;
+};
+
 const wasAttemptedToday = (mapping, now = new Date()) =>
   mapping.lastFetchAttemptAt &&
   getMarketDayKey(mapping.lastFetchAttemptAt) === getMarketDayKey(now);
+
+const wasDailyFetchAttemptedToday = (mapping, now = new Date()) => {
+  const wasAttemptedToday =
+    mapping.lastDailyFetchAttemptAt &&
+    getMarketDayKey(mapping.lastDailyFetchAttemptAt) === getMarketDayKey(now);
+  if (
+    wasAttemptedToday &&
+    mapping.lastFetchErrorCode === RATE_LIMITED_CODE &&
+    now >= getQuotaWindowEnd(mapping.lastDailyFetchAttemptAt)
+  ) {
+    return false;
+  }
+  return wasAttemptedToday;
+};
 
 const persistFetchStatus = async (symbol, values) => {
   await MarketSymbolMappingModel.updateOne(
@@ -262,6 +360,14 @@ const persistFetchStatus = async (symbol, values) => {
 };
 
 const cachedDailyResult = async (symbol, record, mapping, now, fetchError) => {
+  record = getUsableCachedRecord(record, now);
+  if (!record) {
+    throw new MarketDataError(
+      "No recent completed-session close is available.",
+      503,
+      "MARKET_DATA_UNAVAILABLE",
+    );
+  }
   const isStale = isRecordStale(record, now);
   if (Boolean(record.isStale) !== isStale) {
     await MarketDataCacheModel.updateOne(
@@ -286,7 +392,7 @@ const statusCodeForFetchError = (code) => {
   return 503;
 };
 
-const requestAlphaVantage = async (parameters) => {
+const requestAlphaVantage = async (parameters, { onRequestStarted } = {}) => {
   const apiKey = process.env.ALPHA_VANTAGE_API_KEY?.trim();
   if (!apiKey) {
     throw new MarketDataError(
@@ -304,9 +410,21 @@ const requestAlphaVantage = async (parameters) => {
   await reserveDailyRequest();
 
   let response;
+  const requestStartedAt = new Date();
+  const responsePromise = Promise.resolve()
+    .then(() => fetch(url, { signal: AbortSignal.timeout(15000) }))
+    .then(
+      (value) => ({ value }),
+      (error) => ({ error }),
+    );
   try {
-    response = await fetch(url, { signal: AbortSignal.timeout(15000) });
+    await onRequestStarted?.(requestStartedAt);
   } catch (error) {
+    console.error("Unable to persist market-data request attempt", error);
+  }
+  const responseResult = await responsePromise;
+  if (responseResult.error) {
+    const error = responseResult.error;
     const statusCode = error.name === "TimeoutError" ? 504 : 502;
     throw new MarketDataError(
       statusCode === 504
@@ -316,6 +434,7 @@ const requestAlphaVantage = async (parameters) => {
       "MARKET_DATA_PROVIDER_UNAVAILABLE",
     );
   }
+  response = responseResult.value;
 
   if (response.status === 429) {
     await persistProviderCooldown();
@@ -682,8 +801,9 @@ const parseDailySeries = (payload) => {
 };
 
 const getDailySeries = async (symbol, mapping) => {
-  const cached = await MarketDataCacheModel.findOne({ symbol }).lean();
   const now = new Date();
+  const persistedCache = await MarketDataCacheModel.findOne({ symbol }).lean();
+  const cached = getUsableCachedRecord(persistedCache, now);
   const cacheKey = `daily:${symbol}`;
   if (dailyRequestsInFlight.has(cacheKey)) {
     return dailyRequestsInFlight.get(cacheKey);
@@ -693,18 +813,14 @@ const getDailySeries = async (symbol, mapping) => {
     return cachedDailyResult(symbol, cached, mapping, now);
   }
 
-  if (!canRefreshDailyData(now)) {
-    if (cached) {
-      return cachedDailyResult(symbol, cached, mapping, now);
-    }
-    throw new MarketDataError(
-      "No completed-session close is cached. Daily prices refresh after the next market session.",
-      503,
-      "MARKET_DATA_UNAVAILABLE",
-    );
+  if (cached && !canRefreshDailyData(now)) {
+    return cachedDailyResult(symbol, cached, mapping, now);
   }
 
-  if (wasAttemptedToday(mapping, now)) {
+  if (
+    wasDailyFetchAttemptedToday(mapping, now) &&
+    (!cached || mapping.lastDailyFetchAttemptHadCache !== false)
+  ) {
     if (cached) {
       return cachedDailyResult(symbol, cached, mapping, now);
     }
@@ -717,22 +833,43 @@ const getDailySeries = async (symbol, mapping) => {
     );
   }
 
+  let providerRequestStarted = false;
   const request = (async () => {
-    const attemptedAt = new Date();
-    await persistFetchStatus(symbol, {
-      lastFetchAttemptAt: attemptedAt,
-      lastFetchError: null,
-      lastFetchErrorCode: null,
-    });
     try {
+      const completedSessionDate = getLatestCompletedSessionDate(new Date());
       const rows = parseDailySeries(
         await requestAlphaVantage({
           function: "TIME_SERIES_DAILY",
           symbol: mapping.providerSymbol,
           outputsize: "compact",
+        }, {
+          onRequestStarted: async (attemptedAt) => {
+            providerRequestStarted = true;
+            await persistFetchStatus(symbol, {
+              lastFetchAttemptAt: attemptedAt,
+              lastDailyFetchAttemptAt: attemptedAt,
+              lastDailyFetchAttemptHadCache: Boolean(cached),
+              lastFetchError: null,
+              lastFetchErrorCode: null,
+            });
+          },
         }),
-      );
+      ).filter((row) => row.date <= completedSessionDate);
+      if (rows.length === 0) {
+        throw new MarketDataError(
+          "The provider has not returned a completed-session daily close.",
+          503,
+          "MARKET_DATA_UNAVAILABLE",
+        );
+      }
       const latest = rows.at(-1);
+      if (!isWithinMaximumStaleAge(latest.date, completedSessionDate)) {
+        throw new MarketDataError(
+          "The provider has not returned a recent completed-session close.",
+          503,
+          "MARKET_DATA_UNAVAILABLE",
+        );
+      }
       if (cached && latest.date < cached.date) {
         const message =
           "The provider did not return a newer daily close; the cached close was retained.";
@@ -760,7 +897,7 @@ const getDailySeries = async (symbol, mapping) => {
             history: rows,
             fetchedAt: new Date(),
             source: SOURCE,
-            isStale: latest.date < getLatestCompletedSessionDate(new Date()),
+            isStale: latest.date < completedSessionDate,
           },
         },
         {
@@ -787,12 +924,17 @@ const getDailySeries = async (symbol, mapping) => {
         error instanceof MarketDataError
           ? error.code
           : "MARKET_DATA_PROVIDER_UNAVAILABLE";
-      await persistFetchStatus(symbol, {
-        lastFetchError: message,
-        lastFetchErrorCode: code,
-      });
+      if (providerRequestStarted) {
+        await persistFetchStatus(symbol, {
+          lastFetchError: message,
+          lastFetchErrorCode: code,
+        });
+      }
       logMarketDataUnavailable(symbol, error);
-      const fallback = await MarketDataCacheModel.findOne({ symbol }).lean();
+      const fallback = getUsableCachedRecord(
+        await MarketDataCacheModel.findOne({ symbol }).lean(),
+        new Date(),
+      );
       if (fallback) {
         return cachedDailyResult(
           symbol,
@@ -920,6 +1062,7 @@ module.exports = {
   MarketDataError,
   getMarketHistory,
   getMarketQuote,
+  getMarketDataRequestGroups,
   getWatchlistSymbol,
   searchMarketSymbols,
 };
