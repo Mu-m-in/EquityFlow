@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self' http://localhost:4317 https://your-poc-auth.onrender.com; base-uri 'none'; form-action 'self'"
+    >
+    <meta
+      name="referrer"
+      content="no-referrer"
+    >
+    <meta
+      name="auth-origin"
+      content="http://localhost:4317"
+    >
+    <title>TradeHub authentication POC</title>
+    <link rel="stylesheet" href="./styles.css">
+    <script src="./app.js" defer></script>
+  </head>
+  <body>
+    <main class="panel">
+      <p class="eyebrow">EQUITYFLOW · ISOLATED TEST</p>
+      <h1>TradeHub session test</h1>
+      <p id="status" role="status" aria-live="polite">
+        Preparing the authorization flow…
+      </p>
+      <pre id="result" hidden></pre>
+      <div class="actions">
+        <button id="retry" type="button" hidden>Retry authentication</button>
+        <button id="logout" type="button" hidden>End POC session</button>
+      </div>
+      <p class="notice">
+        This isolated page uses a test account and a harmless test endpoint.
+        It does not access EquityFlow production data.
+      </p>
+    </main>
+  </body>
+</html>
