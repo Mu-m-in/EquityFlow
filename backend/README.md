@@ -11,8 +11,10 @@ Create a Render Web Service rooted at `backend` with:
 
 Render supplies `PORT`; do not override it in the Render environment settings.
 The backend waits for MongoDB before listening, reports database readiness at
-`/health`, and handles `SIGINT`/`SIGTERM` by closing HTTP and MongoDB
-connections.
+`/health` (including the current timestamp and process uptime), and handles
+`SIGINT`/`SIGTERM` by closing HTTP and MongoDB connections. Configure UptimeRobot
+to monitor `https://<your-render-service>.onrender.com/health`; the endpoint
+returns `200` when MongoDB is ready and `503` otherwise.
 
 Set these Render environment variables:
 

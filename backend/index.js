@@ -129,7 +129,11 @@ app.get("/health", (_req, res) => {
   const databaseReady = mongoose.connection.readyState === 1;
   return res
     .status(databaseReady ? 200 : 503)
-    .json({ status: databaseReady ? "ok" : "unavailable" });
+    .json({
+      status: databaseReady ? "ok" : "unavailable",
+      timeStamp: new Date().toISOString(),
+      uptime: process.uptime(),
+    });
 });
 app.use(
   createWatchlistRouter({
