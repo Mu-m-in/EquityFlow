@@ -4,38 +4,34 @@ import Home from "./components/Home.jsx";
 import Login from "./components/Login.jsx";
 import { API_URL } from "./config.js";
 
+const getDashboardUser = async () => {
+  const response = await fetch(`${API_URL}/dashboard/auth/me`, {
+    credentials: "include",
+  });
+
+  if (response.status === 401) {
+    return null;
+  }
+
+  if (!response.ok) {
+    throw new Error("Authentication check failed");
+  }
+
+  const data = await response.json();
+  return data.user;
+};
+
 function App() {
   const [auth, setAuth] = useState(null);
-  const [isCheckingAuth, setIsCheckingAuth] = useState(Boolean(API_URL));
-  const [authError, setAuthError] = useState(
-    API_URL ? "" : "Authentication is not configured.",
-  );
+  const [isCheckingAuth, setIsCheckingAuth] = useState(true);
+  const [authError, setAuthError] = useState("");
 
   const checkDashboardAuth = async () => {
-    if (!API_URL) {
-      setAuthError("Authentication is not configured.");
-      setIsCheckingAuth(false);
-      return;
-    }
-
     try {
-      const response = await fetch(`${API_URL}/dashboard/auth/me`, {
-        credentials: "include",
-      });
-
-      if (response.status === 401) {
-        setAuth(null);
-        return;
-      }
-
-      if (!response.ok) {
-        throw new Error("Authentication check failed");
-      }
-
-      const data = await response.json();
-      setAuth({ user: data.user });
+      const user = await getDashboardUser();
+      setAuth(user ? { user } : null);
       setAuthError("");
-    } catch (error) {
+    } catch {
       setAuthError("Unable to verify authentication. Please try again.");
       setAuth(null);
     } finally {
@@ -44,9 +40,29 @@ function App() {
   };
 
   useEffect(() => {
-    if (API_URL) {
-      checkDashboardAuth();
-    }
+    let isCurrent = true;
+    getDashboardUser()
+      .then((user) => {
+        if (isCurrent) {
+          setAuth(user ? { user } : null);
+          setAuthError("");
+        }
+      })
+      .catch(() => {
+        if (isCurrent) {
+          setAuthError("Unable to verify authentication. Please try again.");
+          setAuth(null);
+        }
+      })
+      .finally(() => {
+        if (isCurrent) {
+          setIsCheckingAuth(false);
+        }
+      });
+
+    return () => {
+      isCurrent = false;
+    };
   }, []);
 
   const handleLogin = (user) => {
@@ -67,7 +83,7 @@ function App() {
 
     setAuth(null);
     setAuthError("");
-  } catch (error) {
+  } catch {
     setAuthError("Unable to log out. Please try again.");
   }
 };

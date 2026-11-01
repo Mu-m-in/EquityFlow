@@ -34,7 +34,7 @@ const Login = ({ onLogin }) => {
 
       const data = await response.json();
       onLogin(data.user);
-    } catch (error) {
+    } catch {
       setAuthError("Unable to reach the server. Please try again.");
     } finally {
       setIsSubmitting(false);
