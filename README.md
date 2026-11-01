@@ -9,7 +9,7 @@ to a brokerage or move real money.
 The project is split into a public website, a trading dashboard, and a backend
 API. Each web application is built and run independently.
 
-**Live Demo:** [EquityFlow](https://equity-floww.vercel.app/)
+**Deployed services:** [EquityFlow frontend](https://equity-floww.vercel.app/) · [TradeHub dashboard](https://equityflow-dashboard.vercel.app/) · [Backend API](https://equityflow-fhkv.onrender.com/)
 
 ## Quick start
 
@@ -56,24 +56,28 @@ API. Each web application is built and run independently.
 
 ## Architecture
 
-The public website and dashboard are separate browser applications. Both make
-credentialed requests to the backend API. The API verifies the session cookie,
-scopes user-owned records to the authenticated user, reads and writes MongoDB,
-and fetches or serves cached market data.
+The public website and dashboard are separate browser applications. The public
+website makes credentialed requests directly to the backend API. Dashboard
+requests use the same-origin Vercel API proxy, which forwards approved requests
+to the backend. The API verifies the appropriate application session, scopes
+user-owned records to the authenticated user, reads and writes MongoDB, and
+fetches or serves cached market data.
 
 ```mermaid
 flowchart LR
     Visitor["Visitor"] --> Frontend["Public website (React + Vite)"]
     User["Signed-in user"] --> Dashboard["Trading dashboard (React + Vite)"]
-    Frontend -->|Credentialed API requests| API["Express API"]
-    Dashboard -->|Credentialed API requests| API
+    Frontend -->|Credentialed API requests| API["Express API (Render)"]
+    Dashboard -->|Same-origin /api requests| Proxy["Vercel dashboard API proxy"]
+    Proxy -->|Approved requests| API
     API -->|Users, funds, orders, portfolio, cached prices| MongoDB[("MongoDB")]
     API -->|Daily market data and symbol search| AlphaVantage["Alpha Vantage"]
 ```
 
-In the documented deployment arrangement, the two web apps are deployed as
-separate Vercel projects and the API as a Render web service. The API's CORS
-allowlist is configured with the exact public origins of both web apps.
+The public website and dashboard are separate Vercel projects; the backend is
+a Render web service. The dashboard proxy keeps browser API calls on the
+dashboard origin, avoiding cross-site dashboard cookies in the browser. The
+backend still validates the configured public website and dashboard origins.
 
 ## Project structure
 
@@ -93,10 +97,14 @@ allowlist is configured with the exact public origins of both web apps.
 │   ├── package.json
 │   └── README.md
 ├── dashboard/
+│   ├── api/
+│   │   └── proxy.js          # Same-origin Vercel API proxy
 │   ├── public/
 │   │   └── tradehub-favicon.svg
 │   ├── src/
 │   │   └── components/       # Trading dashboard views
+│   ├── tests/
+│   │   └── proxy.test.js
 │   ├── .env.example
 │   ├── index.html
 │   ├── package.json
@@ -162,7 +170,10 @@ URL `http://localhost:3002`, the website origin
 `http://localhost:5174`. Configure the backend with those exact website and
 dashboard origins. Use a private random JWT secret and a MongoDB connection
 string for your own replica-set-capable database. Do not commit the edited
-environment files.
+environment files. The website uses its configured backend origin directly;
+the dashboard uses `/api`, which the Vite development server proxies to
+`http://localhost:3002` by default. Set `TRADEHUB_API_ORIGIN` in the dashboard
+environment only when using a different local or isolated backend.
 
 ### Seed the default tradable symbols
 
@@ -206,8 +217,9 @@ The example Vite development ports are `5173` for the website and `5174` for
 the dashboard. The dashboard checks the API session on load and sends users
 who are not signed in to the website's login page.
 
-To run the backend test suite, use `npm test` from `backend/`. The web
-applications provide `npm run lint` and `npm run build` scripts.
+To run the backend test suite, use `npm test` from `backend/`. The dashboard
+proxy test suite has 14 tests and runs with `npm test` from `dashboard/`. The
+web applications provide `npm run lint` and `npm run build` scripts.
 
 ## Environment variables
 
@@ -266,42 +278,71 @@ configuration.
 
 ### Trading dashboard (`dashboard/.env.development`)
 
-| Variable | Purpose |
-| --- | --- |
-| `VITE_API_URL` | Backend API origin. Use `http://localhost:3002` locally; production builds require HTTPS. |
-| `VITE_FRONTEND_URL` | Public website origin used for authentication redirects. Use `http://localhost:5173` locally; production builds require HTTPS. |
-| `VITE_DEV_PORT` | Optional Vite development-server port; the example is `5174`. |
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `VITE_DEV_PORT` | No | Optional Vite development-server port; the example is `5174`. |
+| `TRADEHUB_API_ORIGIN` | No | Server-side upstream for local development (defaults to `http://localhost:3002`) or a Vercel Preview deployment (configure an isolated HTTPS API). Not used as a browser-facing `VITE_*` setting. |
+| `ALLOW_PRODUCTION_PREVIEW_API` | No | Vercel Preview only. Set to the exact string `true` together with `TRADEHUB_API_ORIGIN` to explicitly allow Preview access to the production API; proxy access remains limited to authentication and read-only requests. Avoid enabling this except for deliberate testing. |
 
-The public website and dashboard validate that their production API and
-companion-app origins are HTTPS origins. Never put `JWT_SECRET`,
-`MONGO_URL`, or the Alpha Vantage key in either web app's environment.
+The dashboard's browser API base is the same-origin path `/api`; production
+uses the fixed Render backend through the Vercel function. It does not need
+`VITE_API_URL` or `VITE_FRONTEND_URL`. Never put `JWT_SECRET`, `MONGO_URL`, or
+the Alpha Vantage key in either web app's environment. `VITE_*` values are
+embedded in public browser assets.
 
 ## Authentication and security
 
-Registration and login return a JWT in the `equityflow_session` cookie. The
-cookie is HttpOnly, so browser JavaScript cannot read it. Both web apps send
-credentialed requests to the API; the backend verifies the JWT in
-authentication middleware and returns `401` for missing, invalid, or expired
-sessions. Logout clears the cookie.
+The public website and dashboard have separate authentication flows and
+session cookies:
 
+- **Public website:** registration and login set the HttpOnly
+  `equityflow_session` cookie. The website makes credentialed requests directly
+  to the backend API.
+- **Dashboard:** login and session checks use the dashboard-specific
+  `tradehub_dashboard_session` cookie, also HttpOnly. Dashboard browser
+  requests go to same-origin `/api` paths; the Vercel serverless proxy forwards
+  only approved requests to the Render backend. It forwards the dashboard
+  cookie only, never the main application's `equityflow_session` cookie, and
+  relays `Set-Cookie` without exposing a backend cookie domain. The dashboard
+  cookie uses `Secure; SameSite=None`; because the browser talks to its own
+  dashboard origin, it is not sent as a third-party cookie. Safari login
+  persistence, including after a page refresh, has been verified on the
+  deployed dashboard.
+
+The backend validates the correct cookie for each application and returns
+`401` for missing, invalid, or expired sessions. Dashboard and public website
+sessions are distinct even though both authenticate the same user accounts.
 Reads and writes for user-owned data include the authenticated user's ID in
-their database filters. Passwords are stored as bcrypt hashes. The API allows
-credentialed CORS requests only from the configured website and dashboard
-origins. Registration and login share a limit of 10 requests per IP address
-per 15-minute window in each backend process.
+their database filters. Passwords are stored as bcrypt hashes. Registration
+and login share a limit of 10 requests per IP address per 15-minute window in
+each backend process.
+
+The dashboard proxy enforces endpoint and HTTP method allowlists, and validates
+the request host, origin, and referer. Production traffic uses the canonical
+dashboard origin. Preview deployments require an explicitly configured
+upstream; production-backend access requires an additional explicit opt-in.
+Even with that opt-in, Preview requests are limited to login, logout, and
+read-only GET/HEAD requests; all mutations are blocked. The backend also
+allows only the configured website and dashboard origins.
 
 For production, use HTTPS, a unique strong `JWT_SECRET`, restricted MongoDB
 network access, and exact HTTPS origins in `FRONTEND_URL` and
-`DASHBOARD_URL`. Cross-site cookies require `SameSite=None; Secure`; browsers
-may block third-party cookies in that arrangement. The folder-level deployment
-guides recommend testing sign-in and logout in target browsers and using
-related custom domains where possible.
+`DASHBOARD_URL`. The main website's direct cross-site API cookie requires
+`SameSite=None; Secure` when using separate Vercel and Render default domains;
+browser privacy settings may still affect that flow. See the folder-level
+deployment guides for cookie configuration.
 
 ## API documentation
 
-All endpoints are served by the backend. Except for `/health`, registration,
-login, and logout, routes below require a valid `equityflow_session` cookie.
-The web apps send that cookie using credentialed requests.
+The endpoints below are served by the backend. Main website registration,
+login, and logout use the frontend origin and `equityflow_session` cookie.
+Dashboard login, session checks, and logout use
+`/dashboard/auth/login`, `/dashboard/auth/me`, and
+`/dashboard/auth/logout`, respectively, through the same-origin `/api` proxy.
+The proxy allows only the dashboard endpoints and methods required by the
+dashboard. For shared data routes, the backend selects the application's
+cookie using its validated origin; `/market/quote/:symbol` remains
+main-application-only.
 
 | Method | Endpoint | Authentication | Purpose |
 | --- | --- | --- | --- |
@@ -310,6 +351,9 @@ The web apps send that cookie using credentialed requests.
 | `POST` | `/auth/login` | No; rate-limited | Verifies credentials and starts a session. |
 | `POST` | `/auth/logout` | No | Clears the session cookie. |
 | `GET` | `/auth/me` | Yes | Returns the current user's public account details. |
+| `POST` | `/dashboard/auth/login` | No; dashboard origin and rate-limited | Logs the dashboard in and sets its separate session cookie. |
+| `GET` | `/dashboard/auth/me` | Dashboard session | Returns the current dashboard user's public account details. |
+| `POST` | `/dashboard/auth/logout` | No; dashboard origin | Clears the dashboard session cookie. |
 | `GET` | `/watchlist` | Yes | Lists the user's selected symbols and available quote data. |
 | `POST` | `/watchlist` | Yes | Adds a supported symbol to the user's watchlist. |
 | `DELETE` | `/watchlist/:symbol` | Yes | Removes a symbol from the user's watchlist. |
@@ -354,26 +398,32 @@ cooldowns after rate-limit responses.
 
 ## Deployment
 
-The repository's deployment guides document the following arrangement:
+The deployed public frontend, dashboard, and backend are:
+
+- **Public frontend:** [https://equity-floww.vercel.app/](https://equity-floww.vercel.app/)
+- **Trading dashboard:** [https://equityflow-dashboard.vercel.app/](https://equityflow-dashboard.vercel.app/)
+- **Backend API:** [https://equityflow-fhkv.onrender.com/](https://equityflow-fhkv.onrender.com/)
+
+The deployment arrangement is:
 
 - **Public website:** a Vercel project rooted at `frontend/`.
-- **Trading dashboard:** a separate Vercel project rooted at `dashboard/`.
+- **Trading dashboard:** a separate Vercel project rooted at `dashboard/`,
+  including the same-origin serverless API proxy.
 - **Backend API:** a Render web service rooted at `backend/`, started with
   `npm start` and health-checked at `/health`.
 - **Database:** MongoDB Atlas or another MongoDB deployment that supports
   transactions.
 
-Production web builds require HTTPS values for their `VITE_*` service and
-companion-app origins. Configure the API's `FRONTEND_URL` and
-`DASHBOARD_URL` to match the deployed app origins exactly. Render supplies
-`PORT`; do not override it in the Render environment. Read the
+The public website's production build requires HTTPS values for its `VITE_*`
+service and companion-app origins. Configure the API's
+`FRONTEND_URL` and `DASHBOARD_URL` to match the deployed app origins exactly.
+The dashboard's production proxy uses the fixed Render backend origin and
+requires no API-origin `VITE_*` setting. Render supplies `PORT`; do not
+override it in the Render environment. Read the
 [frontend deployment guide](frontend/README.md),
 [dashboard deployment guide](dashboard/README.md), and
 [backend deployment guide](backend/README.md) for platform-specific setup and
 cookie guidance.
-
-No working public demo URL is confirmed by the repository, so none is listed
-here.
 
 ## Known limitations
 
@@ -388,5 +438,3 @@ here.
   demo holdings or positions for new users.
 - Paper orders use MongoDB transactions, so a standalone MongoDB server
   without transaction support is not sufficient.
-- The repository documents deployment configuration but does not confirm
-  that any particular deployment is currently online.
