@@ -16,6 +16,19 @@ const { StockModel } = require("./model/StockModel");
 const { FundsModel } = require("./model/FundsModel");
 const { UserWatchlistEntryModel } = require("./model/UserWatchlistEntryModel");
 const { requireAuth } = require("./middleware/auth");
+const {
+  createRequireAppOrDashboardAuth,
+} = require("./middleware/appOrDashboardAuth");
+const {
+  createRequireDashboardOrigin,
+  createRequireFrontendOrigin,
+} = require("./middleware/dashboardOrigin");
+const {
+  clearDashboardSessionCookie,
+  createDashboardToken,
+  dashboardCookieName,
+  requireDashboardAuth,
+} = require("./middleware/dashboardAuth");
 const { createWatchlistRouter } = require("./routes/watchlist");
 const { PAPER_STARTING_CASH } = require("./config");
 const {
@@ -83,10 +96,13 @@ if (!Number.isInteger(PORT) || PORT <= 0 || PORT > 65535) {
   throw new Error("PORT must be an integer between 1 and 65535");
 }
 
-const allowedOrigins = new Set([
-  validateOrigin(frontendUrl, "FRONTEND_URL"),
-  validateOrigin(dashboardUrl, "DASHBOARD_URL"),
-]);
+const frontendOrigin = validateOrigin(frontendUrl, "FRONTEND_URL");
+const dashboardOrigin = validateOrigin(dashboardUrl, "DASHBOARD_URL");
+const allowedOrigins = new Set([frontendOrigin, dashboardOrigin]);
+const requireAppOrDashboardAuth = createRequireAppOrDashboardAuth({
+  frontendOrigin,
+  dashboardOrigin,
+});
 
 if (!Number.isInteger(cookieMaxAge) || cookieMaxAge <= 0) {
   throw new Error("SESSION_COOKIE_MAX_AGE_MS must be a positive integer");
@@ -137,7 +153,7 @@ app.get("/health", (_req, res) => {
 });
 app.use(
   createWatchlistRouter({
-    requireAuth,
+    requireAppOrDashboardAuth,
     getWatchlistSymbol,
     UserWatchlistEntryModel,
   }),
@@ -252,6 +268,19 @@ const setSessionCookie = (response, user) => {
   );
 };
 
+const setDashboardSessionCookie = (response, user) => {
+  response.cookie(
+    dashboardCookieName,
+    createDashboardToken(user),
+    sessionCookieOptions,
+  );
+};
+
+const requireDashboardOrigin =
+  createRequireDashboardOrigin(dashboardOrigin);
+const requireFrontendOrigin =
+  createRequireFrontendOrigin(frontendOrigin);
+
 const updatePortfolioRecord = async (
   model,
   userId,
@@ -311,46 +340,55 @@ const updatePortfolioRecord = async (
   return record;
 };
 
-app.post("/auth/register", authRateLimit, async (req, res) => {
-  try {
-    const name = String(req.body.name || "").trim();
-    const email = String(req.body.email || "")
-      .trim()
-      .toLowerCase();
-    const password = String(req.body.password || "");
+app.post(
+  "/auth/register",
+  authRateLimit,
+  requireFrontendOrigin,
+  async (req, res) => {
+    try {
+      const name = String(req.body.name || "").trim();
+      const email = String(req.body.email || "")
+        .trim()
+        .toLowerCase();
+      const password = String(req.body.password || "");
 
-    if (!name || !email || password.length < 8) {
-      return res.status(400).json({
-        message:
-          "Name, email, and a password of at least 8 characters are required",
+      if (!name || !email || password.length < 8) {
+        return res.status(400).json({
+          message:
+            "Name, email, and a password of at least 8 characters are required",
+        });
+      }
+
+      const existingUser = await UserModel.findOne({ email });
+      if (existingUser) {
+        return res
+          .status(409)
+          .json({ message: "An account with that email already exists" });
+      }
+
+      const user = await UserModel.create({
+        name,
+        email,
+        passwordHash: await bcrypt.hash(password, 12),
       });
+      await FundsModel.create({
+        userId: user._id,
+        balance: PAPER_STARTING_CASH,
+      });
+
+      setSessionCookie(res, user);
+      return res.status(201).json({ user: publicUser(user) });
+    } catch (error) {
+      return res.status(500).json({ message: "Unable to create account" });
     }
+  },
+);
 
-    const existingUser = await UserModel.findOne({ email });
-    if (existingUser) {
-      return res
-        .status(409)
-        .json({ message: "An account with that email already exists" });
-    }
-
-    const user = await UserModel.create({
-      name,
-      email,
-      passwordHash: await bcrypt.hash(password, 12),
-    });
-    await FundsModel.create({
-      userId: user._id,
-      balance: PAPER_STARTING_CASH,
-    });
-
-    setSessionCookie(res, user);
-    return res.status(201).json({ user: publicUser(user) });
-  } catch (error) {
-    return res.status(500).json({ message: "Unable to create account" });
-  }
-});
-
-app.post("/auth/login", authRateLimit, async (req, res) => {
+app.post(
+  "/auth/login",
+  authRateLimit,
+  requireFrontendOrigin,
+  async (req, res) => {
   try {
     const email = String(req.body.email || "")
       .trim()
@@ -367,14 +405,39 @@ app.post("/auth/login", authRateLimit, async (req, res) => {
   } catch (error) {
     return res.status(500).json({ message: "Unable to log in" });
   }
-});
+},
+);
 
-app.post("/auth/logout", (req, res) => {
+app.post("/auth/logout", requireFrontendOrigin, (req, res) => {
   res.clearCookie("equityflow_session", sessionCookieOptions);
   return res.status(204).end();
 });
 
-app.get("/auth/me", requireAuth, async (req, res) => {
+app.post(
+  "/dashboard/auth/login",
+  authRateLimit,
+  requireDashboardOrigin,
+  async (req, res) => {
+    try {
+      const email = String(req.body.email || "")
+        .trim()
+        .toLowerCase();
+      const password = String(req.body.password || "");
+      const user = await UserModel.findOne({ email });
+
+      if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
+        return res.status(401).json({ message: "Invalid email or password" });
+      }
+
+      setDashboardSessionCookie(res, user);
+      return res.json({ user: publicUser(user) });
+    } catch (error) {
+      return res.status(500).json({ message: "Unable to log in" });
+    }
+  },
+);
+
+app.get("/dashboard/auth/me", requireDashboardOrigin, requireDashboardAuth, async (req, res) => {
   try {
     const user = await UserModel.findById(req.user.userId);
 
@@ -388,7 +451,31 @@ app.get("/auth/me", requireAuth, async (req, res) => {
   }
 });
 
-app.get("/watchlist", requireAuth, async (req, res) => {
+app.post("/dashboard/auth/logout", requireDashboardOrigin, (req, res) => {
+  clearDashboardSessionCookie(res, sessionCookieOptions);
+  return res.status(204).end();
+});
+
+app.get(
+  "/auth/me",
+  requireFrontendOrigin,
+  requireAuth,
+  async (req, res) => {
+  try {
+    const user = await UserModel.findById(req.user.userId);
+
+    if (!user) {
+      return res.status(401).json({ message: "User account not found" });
+    }
+
+    return res.json({ user: publicUser(user) });
+  } catch (error) {
+    return res.status(401).json({ message: "Unable to verify session" });
+  }
+},
+);
+
+app.get("/watchlist", requireAppOrDashboardAuth, async (req, res) => {
   try {
     const [defaultStocks, preferences] = await Promise.all([
       StockModel.find({}, { symbol: 1 }).sort({ symbol: 1 }).lean(),
@@ -451,7 +538,7 @@ app.get("/watchlist", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/watchlist", requireAuth, async (req, res) => {
+app.post("/watchlist", requireAppOrDashboardAuth, async (req, res) => {
   try {
     const symbol = await getWatchlistSymbol(req.body?.symbol);
     const [defaultStocks, preferences] = await Promise.all([
@@ -492,7 +579,7 @@ app.post("/watchlist", requireAuth, async (req, res) => {
   }
 });
 
-app.get("/market/search", requireAuth, async (req, res) => {
+app.get("/market/search", requireAppOrDashboardAuth, async (req, res) => {
   try {
     const matches = await searchMarketSymbols(req.query.keywords);
     return res.json({ matches });
@@ -509,7 +596,7 @@ app.get("/market/quote/:symbol", requireAuth, async (req, res) => {
   }
 });
 
-app.get("/market/history/:symbol", requireAuth, async (req, res) => {
+app.get("/market/history/:symbol", requireAppOrDashboardAuth, async (req, res) => {
   try {
     return res.json(await getMarketHistory(req.params.symbol));
   } catch (error) {
@@ -517,7 +604,7 @@ app.get("/market/history/:symbol", requireAuth, async (req, res) => {
   }
 });
 
-app.get("/funds", requireAuth, async (req, res) => {
+app.get("/funds", requireAppOrDashboardAuth, async (req, res) => {
   try {
     const funds = await getOrCreateFunds(req.user.userId);
     return res.json({ balance: funds.balance });
@@ -527,7 +614,7 @@ app.get("/funds", requireAuth, async (req, res) => {
   }
 });
 
-app.get("/portfolio", requireAuth, async (req, res) => {
+app.get("/portfolio", requireAppOrDashboardAuth, async (req, res) => {
   try {
     const [funds, holdings, positions] = await Promise.all([
       getOrCreateFunds(req.user.userId),
@@ -558,7 +645,7 @@ app.get("/portfolio", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/orders", requireAuth, async (req, res) => {
+app.post("/orders", requireAppOrDashboardAuth, async (req, res) => {
   try {
     const symbol = String(req.body.symbol || "")
       .trim()
@@ -677,7 +764,7 @@ app.post("/orders", requireAuth, async (req, res) => {
   }
 });
 
-app.get("/orders", requireAuth, async (req, res) => {
+app.get("/orders", requireAppOrDashboardAuth, async (req, res) => {
   try {
     const orders = await OrdersModel.find({ userId: req.user.userId }).sort({
       createdAt: -1,
@@ -688,7 +775,7 @@ app.get("/orders", requireAuth, async (req, res) => {
   }
 });
 
-app.get("/allHoldings", requireAuth, async (req, res) => {
+app.get("/allHoldings", requireAppOrDashboardAuth, async (req, res) => {
   try {
     return res.json(await getPortfolioRows(HoldingsModel, req.user.userId));
   } catch (error) {
@@ -697,7 +784,7 @@ app.get("/allHoldings", requireAuth, async (req, res) => {
   }
 });
 
-app.get("/allPositions", requireAuth, async (req, res) => {
+app.get("/allPositions", requireAppOrDashboardAuth, async (req, res) => {
   try {
     return res.json(await getPortfolioRows(PositionsModel, req.user.userId));
   } catch (error) {

@@ -3,13 +3,21 @@ const { afterEach, test } = require("node:test");
 const express = require("express");
 const jwt = require("jsonwebtoken");
 
-const { requireAuth } = require("../middleware/auth");
+const {
+  createRequireAppOrDashboardAuth,
+} = require("../middleware/appOrDashboardAuth");
 const { createWatchlistRouter } = require("./watchlist");
 
 const records = new Map();
 let updates = [];
 let server;
 const previousSecret = process.env.JWT_SECRET;
+const frontendOrigin = "https://app.example.test";
+const dashboardOrigin = "https://dashboard.example.test";
+const requireAppOrDashboardAuth = createRequireAppOrDashboardAuth({
+  frontendOrigin,
+  dashboardOrigin,
+});
 
 const recordKey = (userId, symbol) => `${userId}:${symbol}`;
 
@@ -32,7 +40,7 @@ const startServer = async () => {
 
   app.use(
     createWatchlistRouter({
-      requireAuth,
+      requireAppOrDashboardAuth,
       getWatchlistSymbol: async (symbol) => symbol.toUpperCase(),
       UserWatchlistEntryModel,
     }),
@@ -45,12 +53,29 @@ const startServer = async () => {
 const tokenFor = (userId) =>
   jwt.sign({ userId, email: `${userId}@example.test` }, process.env.JWT_SECRET);
 
-const removeRequest = (baseUrl, symbol, userId) =>
+const dashboardTokenFor = (userId) =>
+  jwt.sign(
+    {
+      userId,
+      email: `${userId}@example.test`,
+      tokenType: "dashboard",
+    },
+    process.env.JWT_SECRET,
+  );
+
+const removeRequest = (baseUrl, symbol, userId, { dashboard = false } = {}) =>
   fetch(`${baseUrl}/watchlist/${encodeURIComponent(symbol)}`, {
     method: "DELETE",
-    headers: userId
-      ? { Cookie: `equityflow_session=${tokenFor(userId)}` }
-      : {},
+    headers: {
+      ...(userId
+        ? {
+            Cookie: dashboard
+              ? `tradehub_dashboard_session=${dashboardTokenFor(userId)}`
+              : `equityflow_session=${tokenFor(userId)}`,
+          }
+        : {}),
+      Origin: dashboard ? dashboardOrigin : frontendOrigin,
+    },
   });
 
 const resetTestState = () => {
@@ -145,7 +170,10 @@ test("ignores attempts to specify another user's watchlist in the URL", async ()
     `${baseUrl}/watchlist/QUICKHEAL?userId=user-b`,
     {
       method: "DELETE",
-      headers: { Cookie: `equityflow_session=${tokenFor("user-a")}` },
+      headers: {
+        Cookie: `equityflow_session=${tokenFor("user-a")}`,
+        Origin: frontendOrigin,
+      },
     },
   );
 
@@ -154,6 +182,38 @@ test("ignores attempts to specify another user's watchlist in the URL", async ()
   assert.equal(records.get(recordKey("user-a", "QUICKHEAL")).included, false);
   assert.deepEqual(updates[0].filter, {
     userId: "user-a",
+    symbol: "QUICKHEAL",
+  });
+});
+
+test("dashboard auth removes only the authenticated user's watchlist symbol", async () => {
+  records.set(recordKey("dashboard-user", "QUICKHEAL"), {
+    userId: "dashboard-user",
+    symbol: "QUICKHEAL",
+    included: true,
+  });
+  records.set(recordKey("other-user", "QUICKHEAL"), {
+    userId: "other-user",
+    symbol: "QUICKHEAL",
+    included: true,
+  });
+  const baseUrl = await startServer();
+
+  const response = await removeRequest(baseUrl, "QUICKHEAL", "dashboard-user", {
+    dashboard: true,
+  });
+
+  assert.equal(response.status, 204);
+  assert.equal(
+    records.get(recordKey("dashboard-user", "QUICKHEAL")).included,
+    false,
+  );
+  assert.equal(
+    records.get(recordKey("other-user", "QUICKHEAL")).included,
+    true,
+  );
+  assert.deepEqual(updates[0].filter, {
+    userId: "dashboard-user",
     symbol: "QUICKHEAL",
   });
 });
