@@ -9,7 +9,7 @@
   "scripts": {
     "start": "node index.js",
     "dev": "node --watch index.js",
-    "test": "node --test services/marketDataService.test.js services/marketDataLogging.test.js routes/watchlist.test.js",
+    "test": "node --test dashboardAuth.test.js middleware/appOrDashboardAuth.test.js middleware/dashboardOrigin.test.js services/marketDataService.test.js services/marketDataLogging.test.js routes/watchlist.test.js",
     "cleanup:demo": "node scripts/cleanup-demo-data.js",
     "seed:stocks": "node scripts/seed-stocks.js"
   },
