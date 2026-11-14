@@ -6,6 +6,10 @@ const MAX_REQUESTS_PER_24H = 25;
 const SOURCE = "Alpha Vantage";
 const RATE_LIMITED_CODE = "MARKET_DATA_RATE_LIMITED";
 const DAILY_QUOTA_EXHAUSTED_CODE = "MARKET_DATA_DAILY_QUOTA_EXHAUSTED";
+const PROVIDER_COOLDOWN_ID = "alpha-vantage-provider";
+// Local protection window for minute-based and unclassified limits, not an
+// assertion about Alpha Vantage's unpublished or account-specific policy.
+const SHORT_PROVIDER_COOLDOWN_MS = 60 * 1000;
 const INDIA_TIME_ZONE = "Asia/Kolkata";
 const MARKET_CLOSE_MINUTES = 15 * 60 + 30;
 const KNOWN_SYMBOLS = [
@@ -32,11 +36,19 @@ const { AlphaVantageQuotaModel } = require("../model/AlphaVantageQuotaModel");
 const { logMarketDataUnavailable } = require("./marketDataLogging");
 
 class MarketDataError extends Error {
-  constructor(message, statusCode = 502, code = "MARKET_DATA_UNAVAILABLE") {
+  constructor(
+    message,
+    statusCode = 502,
+    code = "MARKET_DATA_UNAVAILABLE",
+    retryAt,
+  ) {
     super(message);
     this.name = "MarketDataError";
     this.statusCode = statusCode;
     this.code = code;
+    if (retryAt) {
+      this.retryAt = retryAt;
+    }
   }
 }
 
@@ -119,9 +131,11 @@ const getUsableCachedRecord = (record, now = new Date()) => {
 };
 
 const getRetryAt = (error, failedAt = new Date()) =>
-  error.statusCode === 429
-    ? getQuotaWindowEnd(failedAt)
-    : new Date(
+  error.retryAt instanceof Date
+    ? error.retryAt
+    : error.statusCode === 429
+      ? getQuotaWindowEnd(failedAt)
+      : new Date(
         failedAt.getTime() +
           (error.code === "MARKET_DATA_NOT_CONFIGURED"
             ? 30 * 1000
@@ -179,12 +193,24 @@ const loadCached = async (cache, key, loader) => {
 
 const reserveDailyRequest = async () => {
   const day = new Date().toISOString().slice(0, 10);
-  const quotaState = await AlphaVantageQuotaModel.findOne({ _id: day }).lean();
-  if (quotaState?.cooldownUntil && quotaState.cooldownUntil > new Date()) {
+  const [quotaState, providerState] = await Promise.all([
+    AlphaVantageQuotaModel.findOne({ _id: day }).lean(),
+    AlphaVantageQuotaModel.findOne({ _id: PROVIDER_COOLDOWN_ID }).lean(),
+  ]);
+  const now = new Date();
+  const retryAt = [
+    quotaState?.cooldownUntil,
+    providerState?.cooldownUntil,
+  ]
+    .map((until) => (until ? new Date(until) : null))
+    .filter((until) => until && until > now)
+    .sort((first, second) => second.getTime() - first.getTime())[0];
+  if (retryAt) {
     throw new MarketDataError(
       "Alpha Vantage's request limit has been reached. Please try again later.",
       429,
       RATE_LIMITED_CODE,
+      retryAt,
     );
   }
   try {
@@ -212,16 +238,44 @@ const reserveDailyRequest = async () => {
   }
 };
 
-const persistProviderCooldown = async () => {
-  const cooldownUntil = getQuotaWindowEnd();
-  try {
-    await AlphaVantageQuotaModel.updateOne(
-      { _id: new Date().toISOString().slice(0, 10) },
-      { $max: { cooldownUntil } },
-    );
-  } catch (error) {
-    console.error("Unable to persist Alpha Vantage quota cooldown", error);
+const classifyRateLimit = (message) => {
+  if (
+    !/(?:rate[\s-]?limit|too many requests|frequency.{0,80}(?:exceed|limit|maximum)|(?:exceed|reached).{0,80}frequency|requests?\s+(?:per|each)\s+(?:minute|day)|calls?\s+(?:per|each)\s+(?:minute|day))/i.test(
+      message,
+    )
+  ) {
+    return null;
   }
+  if (/\b(?:per|each)\s+(?:calendar\s+)?day\b|\bdaily\b/i.test(message)) {
+    return "daily";
+  }
+  if (/\b(?:per|each)\s+minute\b|\bminute(?:ly)?\b/i.test(message)) {
+    return "minute";
+  }
+  return "ambiguous";
+};
+
+const getProviderCooldownUntil = (limitType, now = new Date()) =>
+  limitType === "daily"
+    ? getQuotaWindowEnd(now)
+    : new Date(now.getTime() + SHORT_PROVIDER_COOLDOWN_MS);
+
+const persistProviderCooldown = async (cooldownUntil) => {
+  await AlphaVantageQuotaModel.updateOne(
+    { _id: PROVIDER_COOLDOWN_ID },
+    {
+      $setOnInsert: { count: 0 },
+      $max: { cooldownUntil },
+    },
+    { upsert: true },
+  );
+  const providerState = await AlphaVantageQuotaModel.findOne({
+    _id: PROVIDER_COOLDOWN_ID,
+  }).lean();
+  if (!providerState?.cooldownUntil) {
+    throw new Error("Unable to read back the persisted Alpha Vantage cooldown.");
+  }
+  return new Date(providerState.cooldownUntil);
 };
 
 const getMarketDayKey = (date) =>
@@ -341,11 +395,7 @@ const wasDailyFetchAttemptedToday = (mapping, now = new Date()) => {
   const wasAttemptedToday =
     mapping.lastDailyFetchAttemptAt &&
     getMarketDayKey(mapping.lastDailyFetchAttemptAt) === getMarketDayKey(now);
-  if (
-    wasAttemptedToday &&
-    mapping.lastFetchErrorCode === RATE_LIMITED_CODE &&
-    now >= getQuotaWindowEnd(mapping.lastDailyFetchAttemptAt)
-  ) {
+  if (wasAttemptedToday && mapping.lastFetchErrorCode === RATE_LIMITED_CODE) {
     return false;
   }
   return wasAttemptedToday;
@@ -437,11 +487,30 @@ const requestAlphaVantage = async (parameters, { onRequestStarted } = {}) => {
   response = responseResult.value;
 
   if (response.status === 429) {
-    await persistProviderCooldown();
+    let providerMessage;
+    try {
+      const errorPayload = await response.json?.();
+      if (errorPayload && typeof errorPayload === "object") {
+        providerMessage =
+          errorPayload.Note ||
+          errorPayload.Information ||
+          errorPayload.Message;
+      }
+    } catch {
+      // HTTP 429 remains a rate limit even when its optional body is unusable.
+    }
+    const limitType =
+      typeof providerMessage === "string"
+        ? classifyRateLimit(providerMessage) || "ambiguous"
+        : "ambiguous";
+    const retryAt = await persistProviderCooldown(
+      getProviderCooldownUntil(limitType),
+    );
     throw new MarketDataError(
       "Alpha Vantage's request limit has been reached. Please try again later.",
       429,
       RATE_LIMITED_CODE,
+      retryAt,
     );
   }
 
@@ -474,19 +543,20 @@ const requestAlphaVantage = async (parameters, { onRequestStarted } = {}) => {
 
   if (payload.Note || payload.Information) {
     const providerMessage = String(payload.Note || payload.Information);
-    const isRateLimited =
-      /frequency|rate.?limit|requests per day|requests per minute/i.test(
-        providerMessage,
-      );
-    if (isRateLimited) {
-      await persistProviderCooldown();
+    const limitType = classifyRateLimit(providerMessage);
+    let retryAt = limitType
+      ? getProviderCooldownUntil(limitType)
+      : undefined;
+    if (retryAt) {
+      retryAt = await persistProviderCooldown(retryAt);
     }
     throw new MarketDataError(
-      isRateLimited
+      limitType
         ? "Alpha Vantage's request limit has been reached. Please try again later."
         : "Alpha Vantage rejected the request. Check the API key and requested market data.",
-      isRateLimited ? 429 : 503,
-      isRateLimited ? RATE_LIMITED_CODE : "MARKET_DATA_PROVIDER_REJECTED",
+      limitType ? 429 : 503,
+      limitType ? RATE_LIMITED_CODE : "MARKET_DATA_PROVIDER_REJECTED",
+      retryAt,
     );
   }
 

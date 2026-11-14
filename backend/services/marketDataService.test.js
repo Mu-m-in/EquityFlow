@@ -26,7 +26,9 @@ const getQuotaDay = () => new Date().toISOString().slice(0, 10);
 const getQuotaCount = (day = getQuotaDay()) =>
   quotaRecords.get(day)?.count || 0;
 const getQuotaCooldownUntil = (day = getQuotaDay()) =>
-  quotaRecords.get(day)?.cooldownUntil || null;
+  quotaRecords.get(day)?.cooldownUntil ||
+  quotaRecords.get("alpha-vantage-provider")?.cooldownUntil ||
+  null;
 const setQuotaCount = (count, day = getQuotaDay()) => {
   quotaRecords.set(day, {
     ...quotaRecords.get(day),
@@ -715,6 +717,111 @@ test("retries an uncached symbol after a persisted provider cooldown expires", a
   assert.equal(result.data.at(-1).date, "2026-10-09");
 });
 
+test("uses a short persisted cooldown for an explicitly stated per-minute limit", async () => {
+  global.fetch = async () => ({
+    ok: true,
+    json: async () => ({
+      Note: "The API call frequency limit is 5 requests per minute.",
+    }),
+  });
+
+  await assert.rejects(loadService().getMarketHistory("HUL"), {
+    code: "MARKET_DATA_RATE_LIMITED",
+  });
+  assert.equal(
+    getQuotaCooldownUntil().getTime(),
+    Date.now() + 60 * 1000,
+  );
+  assert.notEqual(
+    getQuotaCooldownUntil().getTime(),
+    Date.parse("2026-10-10T00:00:00.000Z"),
+  );
+});
+
+test("uses the UTC daily window for an explicitly stated daily provider limit", async () => {
+  global.fetch = async () => ({
+    ok: true,
+    json: async () => ({
+      Information: "The limit is 25 requests per day.",
+    }),
+  });
+
+  await assert.rejects(loadService().getMarketHistory("HUL"), {
+    code: "MARKET_DATA_RATE_LIMITED",
+  });
+  assert.equal(
+    getQuotaCooldownUntil().toISOString(),
+    "2026-10-10T00:00:00.000Z",
+  );
+});
+
+test("uses the short fallback cooldown for an ambiguous provider rate limit", async () => {
+  global.fetch = async () => ({
+    ok: true,
+    json: async () => ({
+      Note: "The API call frequency has exceeded the limit.",
+    }),
+  });
+
+  await assert.rejects(loadService().getMarketHistory("HUL"), {
+    code: "MARKET_DATA_RATE_LIMITED",
+  });
+  assert.equal(getQuotaCooldownUntil().getTime(), Date.now() + 60 * 1000);
+});
+
+test("HTTP 429 bodies classify explicit minute limits and malformed bodies still cool down", async (t) => {
+  global.fetch = async () => ({
+    ok: false,
+    status: 429,
+    json: async () => ({
+      Information: "Too many requests per minute.",
+    }),
+  });
+
+  await assert.rejects(loadService().getMarketHistory("HUL"), {
+    code: "MARKET_DATA_RATE_LIMITED",
+  });
+  assert.equal(getQuotaCooldownUntil().getTime(), Date.now() + 60 * 1000);
+
+  t.mock.timers.tick(60 * 1000);
+  quotaRecords.delete("alpha-vantage-provider");
+  fetchCallCount = 0;
+  global.fetch = async () => ({
+    ok: false,
+    status: 429,
+    json: async () => {
+      throw new SyntaxError("invalid JSON");
+    },
+  });
+  await assert.rejects(loadService().getMarketHistory("TCS"), {
+    code: "MARKET_DATA_RATE_LIMITED",
+  });
+  assert.equal(getQuotaCooldownUntil().getTime(), Date.now() + 60 * 1000);
+});
+
+test("allows the same symbol after the provider cooldown expires", async (t) => {
+  global.fetch = async () => {
+    fetchCallCount += 1;
+    if (fetchCallCount === 1) {
+      return {
+        ok: true,
+        json: async () => ({ Note: "The API call frequency limit was exceeded." }),
+      };
+    }
+    return makeDailyResponse();
+  };
+
+  const service = loadService();
+  await assert.rejects(service.getMarketHistory("HUL"), {
+    code: "MARKET_DATA_RATE_LIMITED",
+  });
+  t.mock.timers.tick(60 * 1000);
+  const result = await service.getMarketHistory("HUL");
+
+  assert.equal(fetchCallCount, 2);
+  assert.equal(result.data.at(-1).date, "2026-10-09");
+});
+
 test("does not retry genuine provider failures on every request", async () => {
   global.fetch = async () => {
     fetchCallCount += 1;
@@ -870,6 +977,7 @@ test("persists the cooldown when Alpha Vantage responds with HTTP 429", async ()
     statusCode: 429,
     message: /request limit has been reached/i,
   });
+
   await assert.rejects(loadService().getMarketHistory("QUICKHEAL"), {
     code: "MARKET_DATA_RATE_LIMITED",
     statusCode: 429,
@@ -877,6 +985,32 @@ test("persists the cooldown when Alpha Vantage responds with HTTP 429", async ()
   assert.equal(fetchCallCount, 1);
   assert.equal(getQuotaCount(), 1);
   assert.ok(getQuotaCooldownUntil() > new Date());
+});
+
+test("does not classify invalid-key or unsupported-symbol provider messages as rate limits", async () => {
+  global.fetch = async () => ({
+    ok: true,
+    json: async () => ({
+      Information: "The API key is invalid.",
+    }),
+  });
+  await assert.rejects(loadService().getMarketHistory("HUL"), {
+    code: "MARKET_DATA_PROVIDER_REJECTED",
+  });
+  assert.equal(getQuotaCooldownUntil(), null);
+
+  quotaRecords.clear();
+  symbolMappings.clear();
+  global.fetch = async () => ({
+    ok: true,
+    json: async () => ({
+      "Error Message": "Invalid symbol.",
+    }),
+  });
+  await assert.rejects(loadService().getMarketHistory("HUL"), {
+    code: "UNSUPPORTED_MARKET_SYMBOL",
+  });
+  assert.equal(getQuotaCooldownUntil(), null);
 });
 
 test("retries after the persisted daily quota window expires", async (t) => {
