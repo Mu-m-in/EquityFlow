@@ -193,24 +193,15 @@ const loadCached = async (cache, key, loader) => {
 
 const reserveDailyRequest = async () => {
   const day = new Date().toISOString().slice(0, 10);
-  const [quotaState, providerState] = await Promise.all([
-    AlphaVantageQuotaModel.findOne({ _id: day }).lean(),
-    AlphaVantageQuotaModel.findOne({ _id: PROVIDER_COOLDOWN_ID }).lean(),
-  ]);
-  const now = new Date();
-  const retryAt = [
-    quotaState?.cooldownUntil,
-    providerState?.cooldownUntil,
-  ]
-    .map((until) => (until ? new Date(until) : null))
-    .filter((until) => until && until > now)
-    .sort((first, second) => second.getTime() - first.getTime())[0];
-  if (retryAt) {
+  const requestBlock = await getProviderRequestBlock();
+  if (requestBlock) {
     throw new MarketDataError(
-      "Alpha Vantage's request limit has been reached. Please try again later.",
+      requestBlock.code === RATE_LIMITED_CODE
+        ? "Alpha Vantage's request limit has been reached. Please try again later."
+        : "The daily Alpha Vantage request budget has been reached. Please try again later.",
       429,
-      RATE_LIMITED_CODE,
-      retryAt,
+      requestBlock.code,
+      requestBlock.retryAt,
     );
   }
   try {
@@ -234,8 +225,34 @@ const reserveDailyRequest = async () => {
       "The daily Alpha Vantage request budget has been reached. Please try again later.",
       429,
       DAILY_QUOTA_EXHAUSTED_CODE,
+      getQuotaWindowEnd(),
     );
   }
+};
+
+const getProviderRequestBlock = async (now = new Date()) => {
+  const day = now.toISOString().slice(0, 10);
+  const [quotaState, providerState] = await Promise.all([
+    AlphaVantageQuotaModel.findOne({ _id: day }).lean(),
+    AlphaVantageQuotaModel.findOne({ _id: PROVIDER_COOLDOWN_ID }).lean(),
+  ]);
+  const cooldownRetryAt = [
+    quotaState?.cooldownUntil,
+    providerState?.cooldownUntil,
+  ]
+    .map((until) => (until ? new Date(until) : null))
+    .filter((until) => until && until > now)
+    .sort((first, second) => second.getTime() - first.getTime())[0];
+  if (cooldownRetryAt) {
+    return { code: RATE_LIMITED_CODE, retryAt: cooldownRetryAt };
+  }
+  if (quotaState?.count >= MAX_REQUESTS_PER_24H) {
+    return {
+      code: DAILY_QUOTA_EXHAUSTED_CODE,
+      retryAt: getQuotaWindowEnd(now),
+    };
+  }
+  return null;
 };
 
 const classifyRateLimit = (message) => {
@@ -883,10 +900,6 @@ const getDailySeries = async (symbol, mapping) => {
     return cachedDailyResult(symbol, cached, mapping, now);
   }
 
-  if (cached && !canRefreshDailyData(now)) {
-    return cachedDailyResult(symbol, cached, mapping, now);
-  }
-
   if (
     wasDailyFetchAttemptedToday(mapping, now) &&
     (!cached || mapping.lastDailyFetchAttemptHadCache !== false)
@@ -1133,6 +1146,10 @@ module.exports = {
   getMarketHistory,
   getMarketQuote,
   getMarketDataRequestGroups,
+  getProviderRequestBlock,
+  getMarketDayKey,
+  getIndiaMarketClock,
+  getConfiguredMarketHolidays,
   getWatchlistSymbol,
   searchMarketSymbols,
 };

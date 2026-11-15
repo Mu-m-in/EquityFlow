@@ -164,6 +164,24 @@ const makeDailyResponse = (extra = {}) => ({
   }),
 });
 
+const setCachedRecord = (symbol, date) => {
+  marketRecords.set(symbol, {
+    symbol,
+    providerSymbol: `${symbol}.BSE`,
+    companyName: `${symbol} Limited`,
+    date,
+    open: 100,
+    high: 110,
+    low: 95,
+    close: 105,
+    volume: 1000,
+    history: [{ date, open: 100, high: 110, low: 95, close: 105, volume: 1000 }],
+    fetchedAt: new Date(`${date}T12:30:00.000Z`),
+    source: "Alpha Vantage",
+    isStale: true,
+  });
+};
+
 const loadService = () => {
   const servicePath = require.resolve("./marketDataService");
   delete require.cache[servicePath];
@@ -505,6 +523,130 @@ test("retains the latest completed close over the weekend without provider calls
   assert.equal(result.isStale, false);
   assert.equal(result.data.at(-1).date, "2026-10-09");
   assert.equal(fetchCallCount, 0);
+});
+
+test("recovers a missing Friday close from Thursday's cache on Saturday", async (t) => {
+  t.mock.timers.setTime(Date.parse("2026-10-10T12:00:00.000Z"));
+  setCachedRecord("INFY", "2026-10-08");
+
+  const result = await loadService().getMarketHistory("INFY");
+
+  assert.equal(fetchCallCount, 1);
+  assert.equal(result.data.at(-1).date, "2026-10-09");
+  assert.equal(result.isStale, false);
+});
+
+test("does not fetch on Sunday when Friday's close is cached", async (t) => {
+  t.mock.timers.setTime(Date.parse("2026-10-11T12:00:00.000Z"));
+  setCachedRecord("INFY", "2026-10-09");
+
+  const result = await loadService().getMarketHistory("INFY");
+
+  assert.equal(fetchCallCount, 0);
+  assert.equal(result.data.at(-1).date, "2026-10-09");
+  assert.equal(result.isStale, false);
+});
+
+test("recovers a missing Friday close from Thursday's cache on Sunday", async (t) => {
+  t.mock.timers.setTime(Date.parse("2026-10-11T12:00:00.000Z"));
+  setCachedRecord("INFY", "2026-10-08");
+
+  const result = await loadService().getMarketHistory("INFY");
+
+  assert.equal(fetchCallCount, 1);
+  assert.equal(result.data.at(-1).date, "2026-10-09");
+  assert.equal(result.isStale, false);
+});
+
+test("does not request an incomplete Monday session before market close", async (t) => {
+  t.mock.timers.setTime(Date.parse("2026-10-12T08:00:00.000Z"));
+  setCachedRecord("INFY", "2026-10-09");
+
+  const result = await loadService().getMarketHistory("INFY");
+
+  assert.equal(fetchCallCount, 0);
+  assert.equal(result.data.at(-1).date, "2026-10-09");
+  assert.equal(result.isStale, false);
+});
+
+test("permits a Monday refresh after close without accepting incomplete-session data", async (t) => {
+  t.mock.timers.setTime(Date.parse("2026-10-12T12:00:00.000Z"));
+  setCachedRecord("INFY", "2026-10-09");
+  global.fetch = async () => {
+    fetchCallCount += 1;
+    return makeDailyResponse({
+      "2026-10-12": {
+        "1. open": "100",
+        "2. high": "110",
+        "3. low": "95",
+        "4. close": "999",
+        "5. volume": "1000",
+      },
+    });
+  };
+
+  const result = await loadService().getMarketHistory("INFY");
+
+  assert.equal(fetchCallCount, 1);
+  assert.equal(result.data.at(-1).date, "2026-10-09");
+  assert.equal(marketRecords.get("INFY").date, "2026-10-09");
+  assert.equal(result.isStale, true);
+});
+
+test("preserves stale cached data when weekend recovery fails", async (t) => {
+  t.mock.timers.setTime(Date.parse("2026-10-10T12:00:00.000Z"));
+  setCachedRecord("INFY", "2026-10-08");
+  global.fetch = async () => {
+    fetchCallCount += 1;
+    return { ok: false, status: 503 };
+  };
+
+  const result = await loadService().getMarketHistory("INFY");
+
+  assert.equal(fetchCallCount, 1);
+  assert.equal(result.data.at(-1).date, "2026-10-08");
+  assert.equal(result.isStale, true);
+});
+
+test("allows a later recovery attempt after an earlier weekend provider failure", async (t) => {
+  t.mock.timers.setTime(Date.parse("2026-10-10T12:00:00.000Z"));
+  setCachedRecord("INFY", "2026-10-08");
+  global.fetch = async () => {
+    fetchCallCount += 1;
+    return { ok: false, status: 503 };
+  };
+  const saturdayResult = await loadService().getMarketHistory("INFY");
+  assert.equal(saturdayResult.isStale, true);
+
+  t.mock.timers.tick(24 * 60 * 60 * 1000);
+  global.fetch = async () => {
+    fetchCallCount += 1;
+    return makeDailyResponse();
+  };
+  const sundayResult = await loadService().getMarketHistory("INFY");
+
+  assert.equal(fetchCallCount, 2);
+  assert.equal(sundayResult.data.at(-1).date, "2026-10-09");
+  assert.equal(sundayResult.isStale, false);
+});
+
+test("provider cooldown blocks weekend recovery until it expires", async (t) => {
+  t.mock.timers.setTime(Date.parse("2026-10-10T12:00:00.000Z"));
+  setCachedRecord("INFY", "2026-10-08");
+  quotaRecords.set("alpha-vantage-provider", {
+    count: 0,
+    cooldownUntil: new Date(Date.now() + 60 * 1000),
+  });
+
+  const firstResult = await loadService().getMarketHistory("INFY");
+  assert.equal(fetchCallCount, 0);
+  assert.equal(firstResult.isStale, true);
+
+  t.mock.timers.tick(60 * 1000);
+  const result = await loadService().getMarketHistory("INFY");
+
+  assert.equal(fetchCallCount, 1);
+  assert.equal(result.data.at(-1).date, "2026-10-09");
 });
 
 test("retains the latest close on a configured exchange holiday", async () => {

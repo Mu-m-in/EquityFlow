@@ -34,6 +34,11 @@ Optional configuration:
 - `ALPHA_VANTAGE_API_KEY` (market-data feature)
 - `INDIA_MARKET_HOLIDAYS` (comma-separated `YYYY-MM-DD` exchange holidays)
 
+The backend schedules a market-data refresh at 15:45 Asia/Kolkata on weekdays,
+excluding configured holidays. It uses current application stocks and active
+custom watchlist symbols, and coordinates runs through a MongoDB lease. Provider
+requests continue to use the shared daily quota and cooldown protections.
+
 Registration and login share a limit of 10 requests per IP address per
 15-minute window, maintained in each backend process. If running multiple
 instances, use a shared rate-limit store or equivalent edge protection.

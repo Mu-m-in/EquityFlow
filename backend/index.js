@@ -28,6 +28,7 @@ const {
 } = require("./services/marketDataService");
 const { summarizePortfolio } = require("./services/portfolioSummary");
 const { logMarketDataUnavailable } = require("./services/marketDataLogging");
+const { createMarketDataScheduler } = require("./services/marketDataScheduler");
 
 const PORT = Number(process.env.PORT);
 const uri = process.env.MONGO_URL;
@@ -755,6 +756,7 @@ app.use((error, req, res, next) => {
 
 let server;
 let shutdownStarted = false;
+const marketDataScheduler = createMarketDataScheduler();
 
 const shutdown = async (signal) => {
   if (shutdownStarted) {
@@ -762,6 +764,13 @@ const shutdown = async (signal) => {
   }
   shutdownStarted = true;
   console.info(`Received ${signal}; shutting down`);
+
+  try {
+    await marketDataScheduler.stop();
+  } catch {
+    console.error("Market-data scheduler shutdown failed");
+    process.exitCode = 1;
+  }
 
   let forceCloseTimer;
   if (server) {
@@ -807,10 +816,12 @@ const startServer = async () => {
 
     server = app.listen(PORT, () => {
       console.info(`HTTP server listening on port ${PORT}`);
+      marketDataScheduler.start();
     });
     server.on("error", () => {
       console.error("HTTP server failed to listen");
       process.exitCode = 1;
+      void marketDataScheduler.stop();
       void mongoose.disconnect();
     });
   } catch {
